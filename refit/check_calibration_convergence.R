@@ -1,0 +1,17 @@
+additional_library <- Sys.getenv("THREEPAD_ADDITIONAL_R_LIB")
+if (nzchar(additional_library)) .libPaths(c(.libPaths(), additional_library))
+args <- commandArgs(trailingOnly=TRUE)
+stopifnot(length(args) >= 3L)
+root <- normalizePath(args[1])
+project <- normalizePath(args[2])
+corrected_file <- normalizePath(args[3])
+script <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value=TRUE)[1])
+refit_code <- dirname(normalizePath(script))
+suppressPackageStartupMessages(library(dplyr))
+x<-readRDS(file.path(root,'bootstrap/stait/stait_bootstrap_0616.rds'));p<-x$predictions$full$bootstrap;outcome<-p$outcome;lp<-qlogis(pmin(pmax(p$predicted_prob,1e-6),1-1e-6))
+results<-list()
+for(steps in c(100L,1000L,10000L)) {
+ warnings<-character();fit<-withCallingHandlers(glm(outcome~lp,family=binomial(),method=brglm2::brglmFit,type='AS_mean',control=brglm2::brglm_control(maxit=steps)),warning=function(w){warnings<<-c(warnings,conditionMessage(w));invokeRestart('muffleWarning')})
+ results[[as.character(steps)]]<-list(maxit=steps,converged=fit$converged,coefficients=coef(fit),warnings=warnings)
+}
+print(results);cat('lp range',range(lp),'\n');saveRDS(results,file.path(root,'audit/stait_616_calibration_sensitivity.rds'))

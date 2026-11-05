@@ -1,0 +1,13 @@
+additional_library <- Sys.getenv("THREEPAD_ADDITIONAL_R_LIB")
+if (nzchar(additional_library)) .libPaths(c(.libPaths(), additional_library))
+args <- commandArgs(trailingOnly=TRUE)
+stopifnot(length(args) >= 3L)
+root <- normalizePath(args[1])
+project <- normalizePath(args[2])
+corrected_file <- normalizePath(args[3])
+script <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value=TRUE)[1])
+refit_code <- dirname(normalizePath(script))
+x<-readRDS(file.path(root,'bootstrap/stait/stait_bootstrap_0616.rds'));s<-readRDS(file.path(root,'audit/stait_616_calibration_sensitivity.rds'))
+stopifnot(s[['1000']]$converged,s[['10000']]$converged,isTRUE(all.equal(s[['1000']]$coefficients,s[['10000']]$coefficients,tolerance=1e-10)))
+i<-which(x$performance$model=='full');x$performance$calibration_slope_bootstrap[i]<-unname(s[['1000']]$coefficients['lp']);x$performance$optimism_calibration_slope[i]<-x$performance$calibration_slope_bootstrap[i]-x$performance$calibration_slope_validation[i]
+dir.create(file.path(root,'numerical_repairs/stait'),recursive=TRUE,showWarnings=FALSE);saveRDS(x,file.path(root,'numerical_repairs/stait/stait_bootstrap_0616.rds'))

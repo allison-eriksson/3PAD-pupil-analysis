@@ -1,0 +1,5 @@
+variable,display_name,visit,summary,trial_definition,units
+RodDiff,Net Pupil Change,Early pregnancy,Incongruent-minus-congruent mean trial change,Z-scored pupil size at button press minus z-scored pupil size at stimulus onset (0 ms),Z-scored pupil units
+RodDiff2,Net Pupil Change,Late pregnancy,Incongruent-minus-congruent mean trial change,Z-scored pupil size at button press minus z-scored pupil size at stimulus onset (0 ms),Z-scored pupil units
+RodMean,Net Pupil Change,Early pregnancy,Mean trial change across retained trials; auxiliary column not used as a predictor,Z-scored pupil size at button press minus z-scored pupil size at stimulus onset (0 ms),Z-scored pupil units
+RodMean2,Net Pupil Change,Late pregnancy,Mean trial change across retained trials; auxiliary column not used as a predictor,Z-scored pupil size at button press minus z-scored pupil size at stimulus onset (0 ms),Z-scored pupil units

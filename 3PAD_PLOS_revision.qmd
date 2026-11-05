@@ -1,0 +1,7163 @@
+---
+
+title: "3PAD Pupil Dilation – PLOS ONE Revision Analysis"
+author: "Allison Eriksson"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Analysis specification
+
+The pupil measure previously labeled Rate of Dilation is reported as **Net Pupil Change**. Its values and calculation are unchanged. Legacy dataset columns `RodDiff` and `RodDiff2` retain their names for compatibility; see `code/pd_measure_dictionary.csv`.
+
+This document contains the revised statistical analysis for PONE-D-26-14553.
+
+The analysis is reconstructed from the original raw dataset. Previously imputed
+or processed analysis datasets are not used.
+
+Primary analyses comprise three postpartum binary outcomes:
+
+1. Depressive symptoms: EPDS >= 12
+2. State anxiety symptoms: STAI-S >= 40
+3. Trait anxiety symptoms: STAI-T >= 40
+
+For each outcome, two elastic-net logistic regression models will be evaluated:
+
+- Reference model: 32 background and psychological predictors
+- Full model: the same 32 predictors plus 10 pupil-dilation predictors
+
+Model development and internal validation will use the complete analytic cohort
+and bootstrap-first multiple imputation. The complete modelling procedure,
+including imputation and hyperparameter tuning, will be incorporated within
+bootstrap internal validation.
+
+This document calculates missingness directly from the unimputed analytic dataset.
+Postpartum outcome values are not imputed.
+
+
+# Set up project folders
+```{r}
+library(here)
+here::i_am("3PAD_PLOS_revision.qmd")
+setwd(here::here())
+
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/derived", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/bootstrap", recursive = TRUE, showWarnings = FALSE)
+
+stais_bootstrap_output <- here(
+  "output",
+  "bootstrap",
+  "stais"
+)
+
+dir.create(
+  stais_bootstrap_output,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+```
+
+
+# Install packages
+```{r}
+#| eval: false
+# Optional installation only. Preserve the recorded package versions for replication.
+renv::install(c(
+  "tidyverse",
+  "readxl",
+  "naniar",
+  "here",
+  "labelled", 
+  "mice", 
+  "glmnet", 
+  "pROC",
+  "brglm2"
+))
+
+
+renv::snapshot()
+
+
+```
+
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(readxl)
+library(naniar)
+library(here)
+library(labelled)
+library(mice)
+library(glmnet)
+library(pROC)
+library(brglm2)
+
+options(dplyr.summarise.inform = FALSE)
+
+# Verify and load the canonical corrected results; never restore old checkpoints.
+source(here("code", "load_corrected_results.R"))
+```
+
+
+# 1. Data import and analytic cohort
+```{r}
+#| label: import-raw-data
+
+raw_file <- here(
+  "data",
+  "raw",
+  "3PADCombined_R_allSubs_25Oct26.xlsx"
+)
+
+stopifnot(file.exists(raw_file))
+
+df_raw <- read_excel(raw_file)
+
+cat("Raw dataset rows:", nrow(df_raw), "\n")
+cat("Raw dataset columns:", ncol(df_raw), "\n")
+```
+
+## 1.1 Define analysis cohort 
+```{r}
+
+#| label: define-analysis-cohort
+
+# Define participants with all three observed postpartum outcomes
+df_raw$has_postpartum_outcomes <-
+  !is.na(df_raw$ppv6_epds_sum) &
+  !is.na(df_raw$ppv6_stai_s_sum) &
+  !is.na(df_raw$ppv6_stai_t_sum)
+
+# Participant-flow summary
+cohort_flow <- tibble(
+  category = c(
+    "Raw records",
+    "Postpartum outcomes unavailable",
+    "Final analytic cohort"
+  ),
+  n = c(
+    nrow(df_raw),
+    sum(!df_raw$has_postpartum_outcomes),
+    sum(df_raw$has_postpartum_outcomes)
+  )
+)
+
+cohort_flow
+
+# Create analytic cohort
+df <- df_raw %>%
+  filter(has_postpartum_outcomes)
+
+# Reproducibility checks
+stopifnot(nrow(df_raw) == 99)
+stopifnot(nrow(df) == 91)
+
+cat("Analytic cohort:", nrow(df), "participants\n")
+```
+
+# 2. Data and analysis setup
+
+## 2.1 Variable construction
+```{r}
+
+#| label: construct-background-variables
+
+df <- df %>%
+  mutate(
+
+    # BMI
+    gb1_weight = as.numeric(gb1_weight),
+    bmi = gb1_weight / ((gb1_height / 100)^2),
+
+    # Country of birth: Sweden vs other
+    country = case_when(
+      is.na(gb1_country) ~ NA_character_,
+      str_detect(gb1_country, regex("sverige", ignore_case = TRUE)) ~ "Sweden",
+      TRUE ~ "Other"
+    ),
+    country = factor(country, levels = c("Other", "Sweden")),
+
+    # Education
+    edu = case_when(
+      is.na(gb1_edu___4) ~ NA_character_,
+      gb1_edu___4 == 1 ~ "University",
+      TRUE ~ "Less"
+    ),
+    edu = factor(edu, levels = c("Less", "University")),
+
+    # First pregnancy - this is NOT parity
+    first_preg = case_when(
+      is.na(gb1_first_preg) ~ NA_character_,
+      gb1_first_preg == 1 ~ "Yes",
+      gb1_first_preg == 0 ~ "No"
+    ),
+    first_preg = factor(first_preg, levels = c("No", "Yes")),
+
+    # Full-time employment, self-employment, or study
+    workFT = if_else(
+      if_any(
+        c(
+          gb1_job_work___1,
+          gb1_job_business___1,
+          gb1_job_student___1
+        ),
+        ~ . > 0
+      ),
+      "Full-time",
+      "Other",
+      missing = NA_character_
+    ),
+    workFT = factor(workFT, levels = c("Other", "Full-time")),
+
+    # PCOS
+    # REDCap code 1 = yes; other observed response categories collapsed to no,
+    # matching the original analysis
+    pcos = case_when(
+      is.na(gb1_pcos) ~ NA_character_,
+      gb1_pcos == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+    pcos = factor(pcos, levels = c("No", "Yes")),
+
+    # Exercise
+    # Original coding: 1-3 = moderate/high; 4-5 = low/none
+    exercise1 = case_when(
+      is.na(gb1_exercise) ~ NA_character_,
+      gb1_exercise >= 4 ~ "Low to none",
+      TRUE ~ "Moderate to high"
+    ),
+    exercise1 = factor(
+      exercise1,
+      levels = c("Low to none", "Moderate to high")
+    ),
+
+    exercise2 = case_when(
+      is.na(gb2_exercise) ~ NA_character_,
+      gb2_exercise >= 4 ~ "Low to none",
+      TRUE ~ "Moderate to high"
+    ),
+    exercise2 = factor(
+      exercise2,
+      levels = c("Low to none", "Moderate to high")
+    ),
+
+    # SSRI use during early pregnancy
+    SSRI = case_when(
+      is.na(gb1_meds_ja___6) ~ NA_character_,
+      gb1_meds_ja___6 == 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+    SSRI = factor(SSRI, levels = c("No", "Yes"))
+  )
+
+
+
+df <- df %>%
+  mutate(
+
+    # Positive life experiences
+    pos_LE1 = case_when(
+      is.na(gb1_pos_lifeevents) ~ NA_character_,
+      gb1_pos_lifeevents == 1 ~ "No",
+      TRUE ~ "Yes"
+    ),
+    pos_LE1 = factor(pos_LE1, levels = c("No", "Yes")),
+
+    pos_LE2 = case_when(
+      is.na(gb2_pos_lifeevents) ~ NA_character_,
+      gb2_pos_lifeevents == 1 ~ "No",
+      TRUE ~ "Yes"
+    ),
+    pos_LE2 = factor(pos_LE2, levels = c("No", "Yes")),
+
+    # Negative life experiences
+    neg_LE1 = case_when(
+      is.na(gb1_neg_lifeevents) ~ NA_character_,
+      gb1_neg_lifeevents == 1 ~ "No",
+      TRUE ~ "Yes"
+    ),
+    neg_LE1 = factor(neg_LE1, levels = c("No", "Yes")),
+
+    neg_LE2 = case_when(
+      is.na(gb2_neg_lifeevents) ~ NA_character_,
+      gb2_neg_lifeevents == 1 ~ "No",
+      TRUE ~ "Yes"
+    ),
+    neg_LE2 = factor(neg_LE2, levels = c("No", "Yes"))
+  )
+
+```
+
+## 2.2 Define modeling outcomes
+```{r}
+
+#| label: construct-outcomes
+
+df <- df %>%
+  mutate(
+    outcome_epds = as.integer(ppv6_epds_sum >= 12),
+    outcome_stai_s = as.integer(ppv6_stai_s_sum >= 40),
+    outcome_stai_t = as.integer(ppv6_stai_t_sum >= 40)
+  )
+
+# Confirm outcome counts
+outcome_check <- tibble(
+  outcome = c(
+    "EPDS >= 12",
+    "STAI-S >= 40",
+    "STAI-T >= 40"
+  ),
+  low = c(
+    sum(df$outcome_epds == 0),
+    sum(df$outcome_stai_s == 0),
+    sum(df$outcome_stai_t == 0)
+  ),
+  high = c(
+    sum(df$outcome_epds == 1),
+    sum(df$outcome_stai_s == 1),
+    sum(df$outcome_stai_t == 1)
+  )
+)
+
+outcome_check
+```
+
+## 2.2.1 Reproduce corrected Tables 1a and 1b
+
+These descriptive tables use observed values in the 91-participant analytic cohort.
+Categorical percentages use the full group denominator, with missing values shown;
+continuous summaries show the available n when reduced. Tests retain the original
+bivariate workflow. This section does not fit models or run bootstraps.
+
+```{r}
+#| label: corrected-tables-1a-1b
+
+source(here("code", "rebuild_tables_1a_1b.R"))
+table1_results <- rebuild_tables_1a_1b(
+  table1_data = df,
+  output_dir = here("output", "table1_observed_audit")
+)
+
+# Manuscript-ready values, plus unrounded summaries and test audit, are exported.
+# Open output/table1_observed_audit/Tables_1a_1b_corrected.html for both tables.
+knitr::kable(table1_results$table1a,
+  caption = "Table 1a. Characteristics by postpartum depressive symptoms")
+knitr::kable(table1_results$table1b,
+  caption = "Table 1b. Characteristics by postpartum state and trait anxiety")
+cat(table1_results$notes, "\n")
+```
+
+## 2.3 Define predictor sets
+```{r}
+
+#| label: define-predictor-sets
+
+background_vars <- c(
+  "gb1_age",
+  "country",
+  "bmi",
+  "edu",
+  "first_preg",
+  "workFT",
+  "pcos",
+  "exercise1",
+  "exercise2",
+  "SSRI",
+  "pos_LE1",
+  "pos_LE2",
+  "neg_LE1",
+  "neg_LE2"
+)
+
+psychological_vars <- c(
+  "gb1_epds_sum",
+  "gb2_epds_sum",
+  "gb1_stai_s_sum",
+  "gb2_stai_s_sum",
+  "gb1_stai_t_sum",
+  "gb2_stai_t_sum",
+  "gb1_ders16_sum",
+  "gb2_ders16_sum",
+  "gb1_saaq_sum",
+  "gb2_saaq_sum",
+  "gb1_rs14_sum",
+  "gb2_rs14_sum",
+  "gb1_pss_sum",
+  "gb2_pss_sum",
+  "gb1_soc13_sum",
+  "gb2_soc13_sum",
+  "gb1_gad7_sum",
+  "gb2_gad7_sum"
+)
+
+pd_vars <- c(
+  "PARDiff",
+  "PARDiff2",
+  "RodDiff",
+  "RodDiff2",
+  "PCUDiff",
+  "PCUDiff2",
+  "PAADiff",
+  "PAADiff2",
+  "PTRDiff",
+  "PTRDiff2"
+)
+
+baseline_vars <- c(
+  background_vars,
+  psychological_vars
+)
+
+full_vars <- c(
+ baseline_vars,
+  pd_vars
+)
+
+# These numbers are fixed by the analysis plan
+stopifnot(length(background_vars) == 14)
+stopifnot(length(psychological_vars) == 18)
+stopifnot(length(baseline_vars) == 32)
+stopifnot(length(pd_vars) == 10)
+stopifnot(length(full_vars) == 42)
+
+cat("Baseline-model predictors:", length(baseline_vars), "\n")
+cat("PD predictors:", length(pd_vars), "\n")
+cat("Full-model predictors:", length(full_vars), "\n")
+```
+
+
+# 3. Missing-data audit
+```{r}
+
+#| label: create-unimputed-analysis-data
+
+analysis_unimputed <- df %>%
+  select(
+    pid,
+    all_of(full_vars),
+    outcome_epds,
+    outcome_stai_s,
+    outcome_stai_t
+  )
+
+stopifnot(nrow(analysis_unimputed) == 91)
+stopifnot(length(full_vars) == 42)
+
+
+
+```
+
+## 3.1 Overall missingness
+```{r}
+
+#| label: overall-missingness
+
+missingness_summary <- tibble(
+  predictor_set = c(
+    "Reference model predictors",
+    "Pupil-dilation predictors",
+    "Full model predictors"
+  ),
+  n_variables = c(
+    length(baseline_vars),
+    length(pd_vars),
+    length(full_vars)
+  ),
+  n_cells = c(
+    nrow(df) * length(baseline_vars),
+    nrow(df) * length(pd_vars),
+    nrow(df) * length(full_vars)
+  ),
+  n_missing = c(
+    sum(is.na(df[, baseline_vars])),
+    sum(is.na(df[, pd_vars])),
+    sum(is.na(df[, full_vars]))
+  )
+) %>%
+  mutate(
+    percent_missing = 100 * n_missing / n_cells
+  )
+
+missingness_summary
+
+
+
+```
+
+## 3.2 Missingness by predictor
+```{r}
+
+#| label: missingness-by-predictor
+
+missingness_by_predictor <- df %>%
+  select(all_of(full_vars)) %>%
+  summarise(
+    across(
+      everything(),
+      ~ sum(is.na(.))
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(
+    percent_missing = 100 * n_missing / nrow(df),
+    predictor_group = case_when(
+      variable %in% background_vars ~ "Background/clinical",
+      variable %in% psychological_vars ~ "Psychological",
+      variable %in% pd_vars ~ "Pupil dilation",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  arrange(desc(n_missing), variable)
+
+missingness_by_predictor
+```
+
+## 3.3 Pupil missingness
+```{r}
+
+#| label: pupil-missingness-pattern
+
+early_pd_vars <- c(
+  "PARDiff",
+  "RodDiff",
+  "PCUDiff",
+  "PAADiff",
+  "PTRDiff"
+)
+
+late_pd_vars <- c(
+  "PARDiff2",
+  "RodDiff2",
+  "PCUDiff2",
+  "PAADiff2",
+  "PTRDiff2"
+)
+
+pd_missingness_pattern <- df %>%
+  transmute(
+    pid,
+
+    early_pd_n_missing =
+      rowSums(is.na(across(all_of(early_pd_vars)))),
+
+    late_pd_n_missing =
+      rowSums(is.na(across(all_of(late_pd_vars)))),
+
+    all_early_pd_missing =
+      early_pd_n_missing == length(early_pd_vars),
+
+    all_late_pd_missing =
+      late_pd_n_missing == length(late_pd_vars)
+  )
+
+pd_missingness_pattern %>%
+  summarise(
+    participants_missing_all_early_PD =
+      sum(all_early_pd_missing),
+
+    participants_missing_all_late_PD =
+      sum(all_late_pd_missing)
+  )
+```
+
+```{r}
+
+pd_missingness_pattern %>%
+  filter(all_early_pd_missing | all_late_pd_missing)
+```
+
+## 3.4 Participant-level missingness
+```{r}
+#| label: participant-level-missingness
+
+participant_missingness <- df %>%
+  select(pid, all_of(full_vars)) %>%
+  mutate(
+    n_missing_predictors =
+      rowSums(is.na(across(all_of(full_vars)))),
+
+    percent_missing_predictors =
+      100 * n_missing_predictors / length(full_vars)
+  ) %>%
+  select(
+    pid,
+    n_missing_predictors,
+    percent_missing_predictors
+  ) %>%
+  arrange(desc(n_missing_predictors))
+
+participant_missingness
+```
+
+## 3.5 Save output
+```{r}
+
+#| label: export-missingness-tables
+
+write_csv(
+  missingness_summary,
+  here("output", "tables", "missingness_summary.csv")
+)
+
+write_csv(
+  missingness_by_predictor,
+  here("output", "tables", "missingness_by_predictor.csv")
+)
+
+write_csv(
+  participant_missingness,
+  here("output", "tables", "participant_missingness.csv")
+)
+
+saveRDS(
+  analysis_unimputed,
+  here("data", "derived", "analysis_unimputed.rds")
+)
+```
+
+
+
+# 4. Multiple-imputation specification
+
+## 4.1 Define variable types
+```{r}
+#| label: check-variable-classes
+
+binary_vars <- c(
+  "country",
+  "edu",
+  "first_preg",
+  "workFT",
+  "pcos",
+  "exercise1",
+  "exercise2",
+  "SSRI",
+  "pos_LE1",
+  "pos_LE2",
+  "neg_LE1",
+  "neg_LE2"
+)
+
+continuous_vars <- c(
+  "gb1_age",
+  "bmi",
+  psychological_vars,
+  pd_vars
+)
+
+stopifnot(length(binary_vars) == 12)
+stopifnot(length(continuous_vars) == 30)
+stopifnot(
+  setequal(
+    c(binary_vars, continuous_vars),
+    full_vars
+  )
+)
+
+# Check factor levels
+factor_level_check <- tibble(
+  variable = binary_vars,
+  class = map_chr(df[binary_vars], ~ class(.x)[1]),
+  n_levels = map_int(df[binary_vars], nlevels)
+)
+
+factor_level_check
+```
+
+
+## 4.2 MICE helper function
+```{r}
+
+#| label: single-level-predictor-safeguard
+
+fill_single_level_missing <- function(
+  data,
+  predictor_vars
+) {
+
+  fill_log <- tibble(
+    variable = character(),
+    n_missing_filled = integer(),
+    fill_value = character()
+  )
+
+  for (v in predictor_vars) {
+
+    x <- data[[v]]
+
+    n_missing <- sum(is.na(x))
+
+    if (n_missing == 0) {
+      next
+    }
+
+    observed <- x[!is.na(x)]
+
+    n_unique_observed <-
+      dplyr::n_distinct(observed)
+
+    # If absolutely everything is missing, there is
+    # no information available for imputation.
+    if (n_unique_observed == 0) {
+
+      stop(
+        paste0(
+          "Predictor '",
+          v,
+          "' is completely missing in this bootstrap sample."
+        )
+      )
+    }
+
+    # If all observed values are identical, MICE cannot
+    # estimate an imputation model. Fill missing observations
+    # with the only value represented in the bootstrap sample.
+    if (n_unique_observed == 1) {
+
+      fill_value <- observed[1]
+
+      x[is.na(x)] <- fill_value
+
+      data[[v]] <- x
+
+      fill_log <- bind_rows(
+        fill_log,
+        tibble(
+          variable = v,
+          n_missing_filled = n_missing,
+          fill_value = as.character(fill_value)
+        )
+      )
+    }
+  }
+
+  list(
+    data = data,
+    fill_log = fill_log
+  )
+}
+```
+
+
+## 4.3. DEVELOPMENT MICE specification function 
+```{r}
+
+#| label: make-mice-specification-development
+
+make_mice_spec_development <- function(data, outcome_var,predictor_vars = full_vars) {
+
+  imp_data <- data %>%
+    select(
+      all_of(predictor_vars),
+      all_of(outcome_var)
+    )
+  
+  single_level_fix <- fill_single_level_missing(
+  data = imp_data,
+  predictor_vars = predictor_vars
+)
+
+imp_data <- single_level_fix$data
+single_level_fill_log <- single_level_fix$fill_log
+
+  ini <- mice::mice(
+    imp_data,
+    maxit = 0,
+    printFlag = FALSE
+  )
+
+  method <- ini$method
+  predictor_matrix <- ini$predictorMatrix
+
+  # Turn everything off initially
+  method[] <- ""
+  predictor_matrix[,] <- 0
+
+  # ------------------------------------------------------------
+  # Imputation methods
+  # ------------------------------------------------------------
+continuous_present <- intersect(
+  continuous_vars,
+  predictor_vars
+)
+
+continuous_missing <- continuous_present[
+  map_lgl(
+    imp_data[continuous_present],
+    ~ any(is.na(.x))
+  )
+]
+
+method[continuous_missing] <- "pmm"
+
+
+binary_present <- intersect(
+  binary_vars,
+  predictor_vars
+)
+
+binary_missing <- binary_present[
+  map_lgl(
+    imp_data[binary_present],
+    ~ any(is.na(.x))
+  )
+]
+
+
+
+  # Binary predictors:
+# CART is used because bootstrap resampling can create
+# sparse/separated logistic imputation models.
+method[binary_missing] <- "cart"
+  
+
+  # Outcome is observed only
+  method[outcome_var] <- ""
+
+  # ------------------------------------------------------------
+  # Core predictors available to imputation models
+  # ------------------------------------------------------------
+
+  core_vars <- c(
+    "gb1_age",
+    "bmi",
+
+    "gb1_epds_sum",
+    "gb2_epds_sum",
+
+    "gb1_stai_s_sum",
+    "gb2_stai_s_sum",
+
+    "gb1_stai_t_sum",
+    "gb2_stai_t_sum",
+
+    "gb1_gad7_sum",
+    "gb2_gad7_sum",
+
+    "gb1_pss_sum",
+    "gb2_pss_sum",
+
+    outcome_var
+  )
+
+  core_vars <- intersect(
+    core_vars,
+    names(imp_data)
+  )
+
+  # Every variable being imputed can use the core predictors
+  vars_to_impute <- names(method)[method != ""]
+
+  predictor_matrix[
+    vars_to_impute,
+    core_vars
+  ] <- 1
+
+  # ------------------------------------------------------------
+  # Paired early/late variables
+  # ------------------------------------------------------------
+
+  paired_vars <- list(
+    c("exercise1", "exercise2"),
+    c("pos_LE1", "pos_LE2"),
+    c("neg_LE1", "neg_LE2"),
+
+    c("gb1_epds_sum", "gb2_epds_sum"),
+    c("gb1_stai_s_sum", "gb2_stai_s_sum"),
+    c("gb1_stai_t_sum", "gb2_stai_t_sum"),
+    c("gb1_ders16_sum", "gb2_ders16_sum"),
+    c("gb1_saaq_sum", "gb2_saaq_sum"),
+    c("gb1_rs14_sum", "gb2_rs14_sum"),
+    c("gb1_pss_sum", "gb2_pss_sum"),
+    c("gb1_soc13_sum", "gb2_soc13_sum"),
+    c("gb1_gad7_sum", "gb2_gad7_sum"),
+
+    c("PARDiff", "PARDiff2"),
+    c("RodDiff", "RodDiff2"),
+    c("PCUDiff", "PCUDiff2"),
+    c("PAADiff", "PAADiff2"),
+    c("PTRDiff", "PTRDiff2")
+  )
+
+  for (pair in paired_vars) {
+
+    a <- pair[1]
+    b <- pair[2]
+
+    if (
+      a %in% vars_to_impute &&
+      b %in% names(imp_data)
+    ) {
+      predictor_matrix[a, b] <- 1
+    }
+
+    if (
+      b %in% vars_to_impute &&
+      a %in% names(imp_data)
+    ) {
+      predictor_matrix[b, a] <- 1
+    }
+  }
+
+  # ------------------------------------------------------------
+  # Let PD variables inform one another
+  # ------------------------------------------------------------
+
+  pd_present <- intersect(
+    pd_vars,
+    names(imp_data)
+  )
+
+  for (v in intersect(vars_to_impute, pd_present)) {
+
+    other_pd <- setdiff(pd_present, v)
+
+    predictor_matrix[
+      v,
+      other_pd
+    ] <- 1
+  }
+
+  # Never use a variable to predict itself
+  diag(predictor_matrix) <- 0
+
+  # Outcome must never be imputed
+  predictor_matrix[outcome_var, ] <- 0
+
+  list(
+  data = imp_data,
+  method = method,
+  predictor_matrix = predictor_matrix,
+  single_level_fill_log = single_level_fill_log
+)
+}
+```
+
+## 4.4 VALIDATION MICE specification function
+
+```{r}
+#| label: make-mice-specification-validation
+
+make_mice_spec_validation <- function(data, outcome_var, predictor_vars = full_vars) {
+
+  imp_data <- data %>%
+    select(
+      all_of(predictor_vars),
+      all_of(outcome_var)
+    )
+
+  single_level_fix <- fill_single_level_missing(
+  data = imp_data,
+  predictor_vars = predictor_vars
+)
+
+imp_data <- single_level_fix$data
+single_level_fill_log <- single_level_fix$fill_log
+  
+  ini <- mice::mice(
+    imp_data,
+    maxit = 0,
+    printFlag = FALSE
+  )
+
+  method <- ini$method
+  predictor_matrix <- ini$predictorMatrix
+
+  # Turn everything off initially
+  method[] <- ""
+  predictor_matrix[,] <- 0
+
+  # ------------------------------------------------------------
+  # Imputation methods
+  # ------------------------------------------------------------
+
+  continuous_present <- intersect(
+  continuous_vars,
+  predictor_vars
+)
+
+continuous_missing <- continuous_present[
+  map_lgl(
+    imp_data[continuous_present],
+    ~ any(is.na(.x))
+  )
+]
+
+method[continuous_missing] <- "pmm"
+
+
+binary_present <- intersect(
+  binary_vars,
+  predictor_vars
+)
+
+binary_missing <- binary_present[
+  map_lgl(
+    imp_data[binary_present],
+    ~ any(is.na(.x))
+  )
+]
+
+
+# Binary predictors:
+# CART is used because bootstrap resampling can create
+# sparse/separated logistic imputation models.
+ method[binary_missing] <- "cart"
+
+  # Outcome is observed only
+  method[outcome_var] <- ""
+
+  # ------------------------------------------------------------
+  # Core predictors available to imputation models
+  # ------------------------------------------------------------
+
+  core_vars <- c(
+    "gb1_age",
+    "bmi",
+
+    "gb1_epds_sum",
+    "gb2_epds_sum",
+
+    "gb1_stai_s_sum",
+    "gb2_stai_s_sum",
+
+    "gb1_stai_t_sum",
+    "gb2_stai_t_sum",
+
+    "gb1_gad7_sum",
+    "gb2_gad7_sum",
+
+    "gb1_pss_sum",
+    "gb2_pss_sum",
+
+    outcome_var
+  )
+
+  core_vars <- intersect(
+    core_vars,
+    names(imp_data)
+  )
+
+  # Every variable being imputed can use the core predictors
+  vars_to_impute <- names(method)[method != ""]
+
+  predictor_matrix[
+    vars_to_impute,
+    core_vars
+  ] <- 1
+
+  # ------------------------------------------------------------
+  # Paired early/late variables
+  # ------------------------------------------------------------
+
+  paired_vars <- list(
+    c("exercise1", "exercise2"),
+    c("pos_LE1", "pos_LE2"),
+    c("neg_LE1", "neg_LE2"),
+
+    c("gb1_epds_sum", "gb2_epds_sum"),
+    c("gb1_stai_s_sum", "gb2_stai_s_sum"),
+    c("gb1_stai_t_sum", "gb2_stai_t_sum"),
+    c("gb1_ders16_sum", "gb2_ders16_sum"),
+    c("gb1_saaq_sum", "gb2_saaq_sum"),
+    c("gb1_rs14_sum", "gb2_rs14_sum"),
+    c("gb1_pss_sum", "gb2_pss_sum"),
+    c("gb1_soc13_sum", "gb2_soc13_sum"),
+    c("gb1_gad7_sum", "gb2_gad7_sum"),
+
+    c("PARDiff", "PARDiff2"),
+    c("RodDiff", "RodDiff2"),
+    c("PCUDiff", "PCUDiff2"),
+    c("PAADiff", "PAADiff2"),
+    c("PTRDiff", "PTRDiff2")
+  )
+
+  for (pair in paired_vars) {
+
+    a <- pair[1]
+    b <- pair[2]
+
+    if (
+      a %in% vars_to_impute &&
+      b %in% names(imp_data)
+    ) {
+      predictor_matrix[a, b] <- 1
+    }
+
+    if (
+      b %in% vars_to_impute &&
+      a %in% names(imp_data)
+    ) {
+      predictor_matrix[b, a] <- 1
+    }
+  }
+
+  # ------------------------------------------------------------
+  # Let PD variables inform one another
+  # ------------------------------------------------------------
+
+  pd_present <- intersect(
+    pd_vars,
+    names(imp_data)
+  )
+
+  for (v in intersect(vars_to_impute, pd_present)) {
+
+    other_pd <- setdiff(pd_present, v)
+
+    predictor_matrix[
+      v,
+      other_pd
+    ] <- 1
+  }
+
+  # Never use a variable to predict itself
+  diag(predictor_matrix) <- 0
+
+  # Outcome must never be imputed
+  predictor_matrix[outcome_var, ] <- 0
+
+  # Validation outcome must also NOT be used
+# to impute any predictor
+predictor_matrix[, outcome_var] <- 0
+
+list(
+  data = imp_data,
+  method = method,
+  predictor_matrix = predictor_matrix,
+  single_level_fill_log = single_level_fill_log
+)
+}
+```
+
+
+
+## 4.5 EPDS specification checks
+```{r}
+
+#| label: inspect-mice-spec-epds
+
+mice_spec_epds <- make_mice_spec_development(
+  data = df,
+  outcome_var = "outcome_epds"
+)
+
+# Show which variables will actually be imputed and by which method
+mice_methods_epds <- tibble(
+  variable = names(mice_spec_epds$method),
+  method = unname(mice_spec_epds$method)
+) %>%
+  filter(method != "")
+
+mice_methods_epds
+```
+
+
+
+
+
+Check that outcome is protected from imputation
+```{r}
+stopifnot(
+  mice_spec_epds$method["outcome_epds"] == ""
+)
+
+stopifnot(
+  all(
+    mice_spec_epds$predictor_matrix[
+      "outcome_epds",
+    ] == 0
+  )
+)
+
+cat("Outcome is protected from imputation.\n")
+```
+
+Check EPDS 
+```{r}
+# Outcome should be available as a predictor
+# for variables that are being imputed
+mice_spec_epds$predictor_matrix[
+  mice_methods_epds$variable,
+  "outcome_epds"
+]
+```
+
+## 4.6 Diagnostic test of development imputation
+```{r}
+
+#| label: test-mice-epds
+
+set.seed(26092026)
+
+mice_test_epds <- mice(
+  data = mice_spec_epds$data,
+  m = 5,
+  maxit = 20,
+  method = mice_spec_epds$method,
+  predictorMatrix = mice_spec_epds$predictor_matrix,
+  printFlag = TRUE,
+  seed = 26092026
+)
+
+
+mice_test_epds$loggedEvents
+
+plot(mice_test_epds)
+
+
+#| label: inspect-binary-imputation-data
+
+binary_imputation_check <- map_dfr(
+  binary_vars,
+  function(v) {
+
+    x <- df[[v]]
+
+    tibble(
+      variable = v,
+      n_missing = sum(is.na(x)),
+      n_observed = sum(!is.na(x)),
+      level_1 = levels(x)[1],
+      n_level_1 = sum(x == levels(x)[1], na.rm = TRUE),
+      level_2 = levels(x)[2],
+      n_level_2 = sum(x == levels(x)[2], na.rm = TRUE)
+    )
+  }
+)
+
+binary_imputation_check
+```
+
+```{r}
+
+mice_test_epds$loggedEvents
+
+map(
+  1:5,
+  ~ table(complete(mice_test_epds, .x)$outcome_epds)
+)
+
+
+stripplot(
+  mice_test_epds,
+  PARDiff ~ .imp,
+  pch = 20,
+  cex = 1
+)
+
+stripplot(
+  mice_test_epds,
+  gb2_epds_sum ~ .imp,
+  pch = 20,
+  cex = 1
+)
+```
+
+
+# 6. Build bootstrap-first MI engine
+
+## 6.1 Stratified grouped CV folds
+```{r}
+#| label: make-cv-folds
+
+#| label: make-cv-folds
+
+make_stratified_group_folds <- function(
+  data,
+  outcome_var,
+  k = 10,
+  seed = NULL
+) {
+
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+
+  # One row per original participant,
+  # regardless of how many times that participant
+  # occurs in the bootstrap sample
+  unique_people <- data %>%
+    transmute(
+      pid = pid,
+      outcome = .data[[outcome_var]]
+    ) %>%
+    distinct()
+
+  # Distribute event and non-event participants
+  # across folds as evenly as possible
+  fold_map <- unique_people %>%
+    group_by(outcome) %>%
+    mutate(
+      fold = sample(
+        rep(
+          seq_len(k),
+          length.out = n()
+        )
+      )
+    ) %>%
+    ungroup()
+
+  foldid <- fold_map$fold[
+    match(data$pid, fold_map$pid)
+  ]
+
+  # Safety check:
+  # every copy of the same PID must be in the same fold
+  pid_fold_check <- tibble(
+    pid = data$pid,
+    fold = foldid
+  ) %>%
+    group_by(pid) %>%
+    summarise(
+      n_folds = n_distinct(fold),
+      .groups = "drop"
+    )
+
+  stopifnot(
+    all(pid_fold_check$n_folds == 1)
+  )
+
+  foldid
+}
+```
+
+
+## 6.2 Create matching model matrices
+Factors have to produce exactly the same dummy-variable columns in development and validation data.
+
+```{r}
+#| label: model-matrix-helper
+
+make_model_matrices <- function(
+  train_data,
+  validation_data,
+  predictor_vars
+) {
+
+  x_train <- model.matrix(
+    ~ .,
+    data = train_data %>%
+      select(all_of(predictor_vars))
+  )
+
+  x_validation <- model.matrix(
+    ~ .,
+    data = validation_data %>%
+      select(all_of(predictor_vars))
+  )
+
+  # Remove intercept: glmnet handles its own intercept
+  x_train <- x_train[
+    ,
+    colnames(x_train) != "(Intercept)",
+    drop = FALSE
+  ]
+
+  x_validation <- x_validation[
+    ,
+    colnames(x_validation) != "(Intercept)",
+    drop = FALSE
+  ]
+
+  all_columns <- union(
+    colnames(x_train),
+    colnames(x_validation)
+  )
+
+  align_matrix <- function(x, columns) {
+
+    out <- matrix(
+      0,
+      nrow = nrow(x),
+      ncol = length(columns),
+      dimnames = list(NULL, columns)
+    )
+
+    out[, colnames(x)] <- x
+
+    out
+  }
+
+  list(
+    train = align_matrix(
+      x_train,
+      all_columns
+    ),
+    validation = align_matrix(
+      x_validation,
+      all_columns
+    )
+  )
+}
+```
+
+
+## 6.3 Elastic-net fitting and tuning
+- α = 0.10, 0.25, 0.50, 0.75, 1.00
+- stratified grouped 5-fold CV
+- binomial deviance
+- lambda.min
+- glmnet standardization
+
+```{r}
+#| label: fit-elastic-net
+
+fit_elastic_net <- function(
+  train_data,
+  validation_data,
+  outcome_var,
+  predictor_vars,
+  alpha_grid = c(
+    0.10,
+    0.25,
+    0.50,
+    0.75,
+    1.00
+  ),
+  k = 10,
+  seed = 1
+) {
+
+  if (as.character(utils::packageVersion("glmnet")) != "5.0") {
+    stop("The verified analyses used glmnet 5.0. Load the saved corrected results, or restore that version before refitting models.")
+  }
+
+  matrices <- make_model_matrices(
+    train_data = train_data,
+    validation_data = validation_data,
+    predictor_vars = predictor_vars
+  )
+
+  x_train <- matrices$train
+  x_validation <- matrices$validation
+
+  y_train <- train_data[[outcome_var]]
+
+  stopifnot(!anyNA(x_train))
+  stopifnot(!anyNA(x_validation))
+  stopifnot(!anyNA(y_train))
+
+  foldid <- make_stratified_group_folds(
+  data = train_data,
+  outcome_var = outcome_var,
+  k = k,
+  seed = seed
+
+  )
+  
+  # ------------------------------------------------------------
+# Diagnose outcome sparsity within inner CV
+# ------------------------------------------------------------
+
+cv_fold_diagnostics <- map_dfr(
+  sort(unique(foldid)),
+  function(f) {
+
+    training_rows <- foldid != f
+
+    tibble(
+      fold = f,
+
+      n_train = sum(training_rows),
+
+      n_events_train =
+        sum(y_train[training_rows] == 1),
+
+      n_non_events_train =
+        sum(y_train[training_rows] == 0),
+
+      n_unique_events_train =
+        n_distinct(
+          train_data$pid[
+            training_rows &
+            y_train == 1
+          ]
+        ),
+
+      n_unique_non_events_train =
+        n_distinct(
+          train_data$pid[
+            training_rows &
+            y_train == 0
+          ]
+        )
+    )
+  }
+)
+
+  # Capture glmnet warnings so that large bootstrap runs
+# do not fill the Console with repeated messages.
+
+glmnet_warnings <- character()
+
+capture_glmnet_warnings <- function(expr) {
+
+  withCallingHandlers(
+    expr,
+
+    warning = function(w) {
+
+      glmnet_warnings <<- c(
+        glmnet_warnings,
+        conditionMessage(w)
+      )
+
+      invokeRestart("muffleWarning")
+    }
+  )
+}
+  # Use identical fold assignments for every alpha
+  cv_models <- map(
+    alpha_grid,
+    function(a) {
+
+     capture_glmnet_warnings(
+  glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = a,
+    foldid = foldid,
+    type.measure = "deviance",
+    grouped = FALSE,
+    standardize = TRUE
+  )
+)
+    }
+  )
+
+  # Compare alpha values using their minimum CV deviance
+  cv_deviance <- map_dbl(
+    cv_models,
+    ~ min(.x$cvm, na.rm = TRUE)
+  )
+
+  best_index <- which.min(cv_deviance)
+
+  best_alpha <- alpha_grid[best_index]
+  best_cv <- cv_models[[best_index]]
+  best_lambda <- best_cv$lambda.min
+
+  # Refit final model on the complete development sample
+  final_fit <- capture_glmnet_warnings(
+  glmnet::glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = best_alpha,
+    lambda = best_lambda,
+    standardize = TRUE
+  )
+)
+
+  # Numerical safeguard for full models: a failed standalone fit is refitted
+  # along a warm-start path to the SAME CV-selected alpha and lambda.
+  # This reproduces the documented repairs without changing cached baseline fits.
+  if (identical(predictor_vars, full_vars) && final_fit$jerr != 0L) {
+    regular_path <- capture_glmnet_warnings(glmnet::glmnet(
+      x = x_train, y = y_train, family = "binomial", alpha = best_alpha,
+      standardize = TRUE
+    ))
+    refit_lambdas <- sort(unique(c(
+      regular_path$lambda[regular_path$lambda >= best_lambda], best_lambda
+    )), decreasing = TRUE)
+    final_fit <- capture_glmnet_warnings(glmnet::glmnet(
+      x = x_train, y = y_train, family = "binomial", alpha = best_alpha,
+      lambda = refit_lambdas, standardize = TRUE
+    ))
+    stopifnot(final_fit$jerr == 0L)
+
+  }
+
+  train_prediction <- as.numeric(
+    predict(
+      final_fit,
+      s = best_lambda,
+      newx = x_train,
+      type = "response"
+    )
+  )
+
+  validation_prediction <- as.numeric(
+    predict(
+      final_fit,
+      s = best_lambda,
+      newx = x_validation,
+      type = "response"
+    )
+  )
+
+  coef_matrix <- as.matrix(
+    coef(final_fit, s = best_lambda)
+  )
+
+  coef_table <- tibble(
+    variable = rownames(coef_matrix),
+    coefficient = coef_matrix[, 1]
+  ) %>%
+    filter(variable != "(Intercept)") %>%
+    mutate(
+      selected = coefficient != 0,
+      direction = case_when(
+        coefficient > 0 ~ "positive",
+        coefficient < 0 ~ "negative",
+        TRUE ~ "zero"
+      )
+    )
+
+  list(
+  alpha = best_alpha,
+  lambda = best_lambda,
+  cv_deviance = cv_deviance[best_index],
+
+  train_prediction = train_prediction,
+  validation_prediction = validation_prediction,
+
+  coefficients = coef_table,
+
+  cv_fold_diagnostics = cv_fold_diagnostics,
+
+  glmnet_warning_n =
+    length(glmnet_warnings),
+
+  glmnet_warning_text =
+    paste(
+      unique(glmnet_warnings),
+      collapse = " | "
+    )
+)
+}
+```
+
+## 6.4 Calibration metrics helper
+
+```{r}
+#| label: calibration-metrics
+
+
+calculate_calibration <- function(
+  outcome,
+  predicted_prob,
+  retry_nonconvergence = FALSE
+) {
+
+  eps <- 1e-6
+
+  p <- pmin(
+    pmax(
+      as.numeric(predicted_prob),
+      eps
+    ),
+    1 - eps
+  )
+
+  lp <- qlogis(p)
+
+  # ----------------------------------------------------------
+  # Calibration intercept
+  # ----------------------------------------------------------
+
+  intercept_fit <- glm(
+    outcome ~ offset(lp),
+    family = binomial(),
+    method = brglm2::brglmFit,
+    type = "AS_mean"
+  )
+
+  calibration_intercept <-
+    unname(coef(intercept_fit)[1])
+
+  # ----------------------------------------------------------
+  # Calibration slope
+  #
+  # If all predictions are identical, the linear predictor has
+  # zero variance and the calibration slope is not estimable.
+  # ----------------------------------------------------------
+
+  lp_range <- diff(range(lp))
+
+  slope_estimable <-
+    is.finite(lp_range) &&
+    lp_range > 1e-12
+
+  if (slope_estimable) {
+
+    slope_fit <- glm(
+      outcome ~ lp,
+      family = binomial(),
+      method = brglm2::brglmFit,
+      type = "AS_mean"
+    )
+
+    if (retry_nonconvergence && !isTRUE(slope_fit$converged)) {
+      slope_fit <- glm(
+        outcome ~ lp, family = binomial(), method = brglm2::brglmFit,
+        type = "AS_mean", control = brglm2::brglm_control(maxit = 1000L)
+      )
+      stopifnot(isTRUE(slope_fit$converged))
+    }
+
+    calibration_slope <-
+      unname(coef(slope_fit)["lp"])
+
+  } else {
+
+    calibration_slope <- NA_real_
+  }
+
+  tibble(
+    calibration_intercept =
+      calibration_intercept,
+
+    calibration_slope =
+      calibration_slope,
+
+    calibration_slope_estimable =
+      slope_estimable
+  )
+}
+
+```
+
+
+## 6.5 One bootstrap iteration
+
+This function will:
+1. draw one bootstrap sample;
+2. impute the development sample with outcome information available;
+3. impute the original cohort as validation data with the validation outcome hidden;
+4. fit the elastic net separately in each imputation;
+5. average predictions across imputations;
+6. calculate bootstrap-sample and validation AUC;
+7. retain α, λ and coefficients.
+```{r}
+#| label: run-one-bootstrap
+
+run_one_bootstrap <- function(
+  data,
+  outcome_var,
+  predictor_vars,
+  m = 3,
+  bootstrap_id = 1,
+  seed = 26092026
+) {
+
+  set.seed(seed + bootstrap_id)
+
+  # ----------------------------------------------------------
+  # 1. Draw bootstrap development sample
+  # ----------------------------------------------------------
+
+  repeat {
+
+    bootstrap_index <- sample.int(
+      n = nrow(data),
+      size = nrow(data),
+      replace = TRUE
+    )
+
+    boot_data <- data[
+      bootstrap_index,
+      ,
+      drop = FALSE
+    ]
+
+    # Need both outcome classes present
+    if (length(unique(boot_data[[outcome_var]])) == 2) {
+      break
+    }
+  }
+
+  # ----------------------------------------------------------
+  # 2. DEVELOPMENT MI
+  #
+  # Postpartum outcome may help impute missing predictors.
+  # ----------------------------------------------------------
+
+  dev_spec <- make_mice_spec_development(
+    data = boot_data,
+    outcome_var = outcome_var, 
+    predictor_vars = predictor_vars
+  )
+
+  dev_imp <- mice::mice(
+    data = dev_spec$data,
+    m = m,
+    maxit = 20,
+    method = dev_spec$method,
+    predictorMatrix = dev_spec$predictor_matrix,
+    printFlag = FALSE,
+    seed = seed + bootstrap_id * 100
+  )
+
+  # ----------------------------------------------------------
+  # 3. VALIDATION MI
+  #
+  # Original cohort is appended to bootstrap development data.
+  # Validation rows are ignored when fitting imputation models.
+  # Validation outcomes are hidden.
+  # ----------------------------------------------------------
+
+  development_for_validation <- boot_data
+
+  validation_for_imputation <- data
+
+  validation_for_imputation[[outcome_var]] <- NA_integer_
+
+  combined_for_validation <- bind_rows(
+    development_for_validation,
+    validation_for_imputation
+  )
+
+  # FALSE = development rows used to estimate imputation models
+  # TRUE  = validation rows excluded from estimating them
+  validation_ignore <- c(
+    rep(FALSE, nrow(development_for_validation)),
+    rep(TRUE, nrow(validation_for_imputation))
+  )
+
+  val_spec <- make_mice_spec_validation(
+    data = combined_for_validation,
+    outcome_var = outcome_var, 
+    predictor_vars = predictor_vars
+  )
+
+  val_imp <- mice::mice(
+    data = val_spec$data,
+    m = m,
+    maxit = 20,
+    method = val_spec$method,
+    predictorMatrix = val_spec$predictor_matrix,
+    ignore = validation_ignore,
+    printFlag = FALSE,
+    seed = seed + bootstrap_id * 100 + 50
+  )
+
+  # ----------------------------------------------------------
+  # 4. Fit model separately in each imputed dataset
+  # ----------------------------------------------------------
+
+  train_pred_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(boot_data),
+    ncol = m
+  )
+
+  validation_pred_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(data),
+    ncol = m
+  )
+
+  tuning_list <- vector("list", m)
+  coefficient_list <- vector("list", m)
+
+  for (j in seq_len(m)) {
+
+    # Development data
+    train_j <- mice::complete(
+      dev_imp,
+      j
+    )
+
+    # PID is not imputed, so add it back
+    train_j$pid <- boot_data$pid
+
+    # Validation data
+    validation_combined_j <- mice::complete(
+      val_imp,
+      j
+    )
+
+    first_validation_row <- nrow(boot_data) + 1
+
+    validation_j <- validation_combined_j[
+      first_validation_row:nrow(validation_combined_j),
+      ,
+      drop = FALSE
+    ]
+
+    validation_j$pid <- data$pid
+
+    # Restore the true outcome only AFTER imputation is complete
+    validation_j[[outcome_var]] <-
+      data[[outcome_var]]
+
+    model_j <- fit_elastic_net(
+      train_data = train_j,
+      validation_data = validation_j,
+      outcome_var = outcome_var,
+      predictor_vars = predictor_vars,
+      k = 5,
+      seed = seed +
+        bootstrap_id * 1000 
+    )
+
+    train_pred_matrix[, j] <-
+      model_j$train_prediction
+
+    validation_pred_matrix[, j] <-
+      model_j$validation_prediction
+
+    tuning_list[[j]] <- tibble(
+      bootstrap = bootstrap_id,
+      imputation = j,
+      alpha = model_j$alpha,
+      lambda = model_j$lambda,
+      cv_deviance = model_j$cv_deviance,
+      n_selected =
+        sum(model_j$coefficients$selected),
+      min_cv_events =
+    min(
+      model_j$cv_fold_diagnostics$n_events_train
+    ),
+
+  min_cv_unique_events =
+    min(
+      model_j$cv_fold_diagnostics$n_unique_events_train
+    ),
+
+  glmnet_warning_n =
+    model_j$glmnet_warning_n,
+
+  glmnet_warning_text =
+    model_j$glmnet_warning_text
+    )
+
+    coefficient_list[[j]] <-
+      model_j$coefficients %>%
+      mutate(
+        bootstrap = bootstrap_id,
+        imputation = j
+      )
+  }
+
+  # ----------------------------------------------------------
+  # 5. Average predicted probabilities across imputations
+  # ----------------------------------------------------------
+
+  mean_train_prediction <- rowMeans(
+    train_pred_matrix
+  )
+
+  mean_validation_prediction <- rowMeans(
+    validation_pred_matrix
+  )
+
+  stopifnot(
+    !anyNA(mean_train_prediction),
+    !anyNA(mean_validation_prediction)
+  )
+
+  # ----------------------------------------------------------
+  # 6. Calculate discrimination
+  # ----------------------------------------------------------
+
+  auc_bootstrap <- as.numeric(
+    pROC::auc(
+      response = boot_data[[outcome_var]],
+      predictor = mean_train_prediction,
+      quiet = TRUE
+    )
+  )
+
+  auc_validation <- as.numeric(
+    pROC::auc(
+      response = data[[outcome_var]],
+      predictor = mean_validation_prediction,
+      quiet = TRUE
+    )
+  )
+
+  
+  calibration_bootstrap <- calculate_calibration(
+  outcome = boot_data[[outcome_var]],
+  predicted_prob = mean_train_prediction,
+  retry_nonconvergence = identical(predictor_vars, full_vars)
+)
+
+calibration_validation <- calculate_calibration(
+  outcome = data[[outcome_var]],
+  predicted_prob = mean_validation_prediction,
+  retry_nonconvergence = identical(predictor_vars, full_vars)
+)
+
+
+  performance <- tibble(
+  bootstrap = bootstrap_id,
+
+  auc_bootstrap = auc_bootstrap,
+  auc_validation = auc_validation,
+
+  optimism_auc =
+    auc_bootstrap -
+    auc_validation,
+
+  calibration_intercept_bootstrap =
+    calibration_bootstrap$calibration_intercept,
+
+  calibration_intercept_validation =
+    calibration_validation$calibration_intercept,
+
+  optimism_calibration_intercept =
+    calibration_bootstrap$calibration_intercept -
+    calibration_validation$calibration_intercept,
+
+  calibration_slope_bootstrap =
+    calibration_bootstrap$calibration_slope,
+
+  calibration_slope_validation =
+    calibration_validation$calibration_slope,
+
+  optimism_calibration_slope =
+    calibration_bootstrap$calibration_slope -
+    calibration_validation$calibration_slope
+
+  )
+  diagnostics <- tibble(
+  bootstrap = bootstrap_id,
+
+  n_bootstrap_rows = nrow(boot_data),
+
+  n_unique_participants =
+    n_distinct(boot_data$pid),
+
+  n_events =
+    sum(boot_data[[outcome_var]] == 1),
+
+  n_non_events =
+    sum(boot_data[[outcome_var]] == 0),
+
+  n_unique_events =
+    boot_data %>%
+    distinct(pid, .data[[outcome_var]]) %>%
+    summarise(
+      n = sum(.data[[outcome_var]] == 1)
+    ) %>%
+    pull(n),
+
+  dev_mice_logged_events =
+    ifelse(
+      is.null(dev_imp$loggedEvents),
+      0,
+      nrow(dev_imp$loggedEvents)
+    ),
+
+  val_mice_logged_events =
+    ifelse(
+      is.null(val_imp$loggedEvents),
+      0,
+      nrow(val_imp$loggedEvents)
+    )
+  )
+
+  list(
+  performance = performance,
+  tuning = bind_rows(tuning_list),
+  coefficients = bind_rows(coefficient_list),
+  diagnostics = diagnostics,
+
+  predictions = list(
+    bootstrap = tibble(
+      pid = boot_data$pid,
+      outcome = boot_data[[outcome_var]],
+      predicted_prob = mean_train_prediction
+    ),
+
+    validation = tibble(
+      pid = data$pid,
+      outcome = data[[outcome_var]],
+      predicted_prob = mean_validation_prediction
+    )
+  ),
+
+  bootstrap_index = bootstrap_index
+)
+}
+```
+
+### Calibration test - Run one bootstrap 
+```{r}
+epds_calibration_test <- run_one_bootstrap(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = full_vars,
+  m = 3,
+  bootstrap_id = 1,
+  seed = 26092026
+)
+
+
+epds_calibration_test$performance
+
+epds_calibration_test$predictions$validation
+
+```
+
+## 6.6 Run one bootstrap sample to test
+```{r}
+epds_one_bootstrap <- run_one_bootstrap(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = full_vars,
+  m = 3,
+  bootstrap_id = 1,
+  seed = 26092026
+)
+
+epds_one_bootstrap$performance
+
+epds_one_bootstrap$tuning
+
+epds_one_bootstrap$coefficients %>%
+  filter(selected) %>%
+  arrange(imputation, desc(abs(coefficient)))
+
+epds_one_bootstrap$diagnostics
+
+
+```
+
+
+## 6.7 5-bootstrap smoke test
+
+```{r}
+#| label: run-bootstrap-smoke-series
+
+run_bootstrap_series <- function(
+  data,
+  outcome_var,
+  predictor_vars,
+  B = 5,
+  m = 3,
+  seed = 26092026
+) {
+
+  performance_list <- vector("list", B)
+  tuning_list <- vector("list", B)
+  coefficient_list <- vector("list", B)
+  diagnostic_list <- vector("list", B)
+
+  for (b in seq_len(B)) {
+
+    cat(
+      "\nBootstrap",
+      b,
+      "of",
+      B,
+      "\n"
+    )
+
+    result_b <- run_one_bootstrap(
+      data = data,
+      outcome_var = outcome_var,
+      predictor_vars = predictor_vars,
+      m = m,
+      bootstrap_id = b,
+      seed = seed
+    )
+
+    performance_list[[b]] <-
+      result_b$performance
+
+    tuning_list[[b]] <-
+      result_b$tuning
+
+    coefficient_list[[b]] <-
+      result_b$coefficients
+
+    diagnostic_list[[b]] <-
+      result_b$diagnostics
+  }
+
+  list(
+    performance = bind_rows(performance_list),
+    tuning = bind_rows(tuning_list),
+    coefficients = bind_rows(coefficient_list),
+    diagnostics = bind_rows(diagnostic_list)
+  )
+}
+```
+
+
+Run 5-bootstrap test
+```{r}
+#| label: test-five-bootstraps
+
+epds_full_smoke5 <- run_bootstrap_series(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = full_vars,
+  B = 5,
+  m = 3,
+  seed = 26092026
+)
+```
+
+5-Bootstrap Diagnostics
+```{r}
+epds_full_smoke5$diagnostics
+
+epds_full_smoke5$performance
+
+epds_full_smoke5$tuning
+
+epds_full_smoke5$coefficients %>%
+  filter(selected) %>%
+  count(variable, sort = TRUE)
+```
+
+
+```{r}
+# Recreate bootstrap 1 exactly
+set.seed(26092026 + 1)
+
+bootstrap_index_check <- sample.int(
+  n = nrow(df),
+  size = nrow(df),
+  replace = TRUE
+)
+
+boot_check <- df[
+  bootstrap_index_check,
+  ,
+  drop = FALSE
+]
+
+# Generate the grouped 10-fold assignments
+fold_check <- make_stratified_group_folds(
+  data = boot_check,
+  outcome_var = "outcome_epds",
+  k = 10,
+  seed = 26092026 + 1000
+)
+
+# Check whether duplicated participants ever cross folds
+duplicate_fold_check <- tibble(
+  pid = boot_check$pid,
+  fold = fold_check
+) %>%
+  group_by(pid) %>%
+  summarise(
+    n_copies = n(),
+    n_folds = n_distinct(fold),
+    .groups = "drop"
+  ) %>%
+  filter(n_copies > 1) %>%
+  arrange(desc(n_copies))
+
+duplicate_fold_check
+
+table(fold_check)
+
+tibble(
+  fold = fold_check,
+  outcome = boot_check$outcome_epds
+) %>%
+  count(fold, outcome) %>%
+  tidyr::pivot_wider(
+    names_from = outcome,
+    values_from = n,
+    values_fill = 0
+  )
+
+
+body(fit_elastic_net)
+```
+
+
+## 6.7 20-bootstrap smoke test
+```{r}
+epds_full_stress20 <- run_bootstrap_series(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = full_vars,
+  B = 20,
+  m = 3,
+  seed = 26092026
+)
+```
+
+
+
+Diagnostics for 20-B smoke test
+```{r}
+epds_full_stress20$diagnostics
+
+epds_full_stress20$tuning %>%
+  select(
+    bootstrap,
+    imputation,
+    min_cv_events,
+    min_cv_unique_events,
+    glmnet_warning_n,
+    glmnet_warning_text
+  )
+
+
+epds_full_stress20$tuning %>%
+  summarise(
+    n_fits = n(),
+
+    fits_with_warning =
+      sum(glmnet_warning_n > 0),
+
+    percent_with_warning =
+      100 * mean(glmnet_warning_n > 0),
+
+    lowest_cv_event_count =
+      min(min_cv_events),
+
+    lowest_cv_unique_event_count =
+      min(min_cv_unique_events)
+  )
+
+
+
+epds_full_stress20$tuning %>%
+  filter(glmnet_warning_n > 0) %>%
+  distinct(
+    bootstrap,
+    min_cv_events,
+    min_cv_unique_events,
+    glmnet_warning_text
+  )
+```
+
+
+```{r}
+epds_full_stress20$performance %>%
+  summarise(
+    n_bootstraps = n(),
+    n_missing_auc_bootstrap = sum(is.na(auc_bootstrap)),
+    n_missing_auc_validation = sum(is.na(auc_validation)),
+    min_auc_bootstrap = min(auc_bootstrap, na.rm = TRUE),
+    max_auc_bootstrap = max(auc_bootstrap, na.rm = TRUE),
+    min_auc_validation = min(auc_validation, na.rm = TRUE),
+    max_auc_validation = max(auc_validation, na.rm = TRUE),
+    min_optimism = min(optimism, na.rm = TRUE),
+    max_optimism = max(optimism, na.rm = TRUE)
+  )
+
+warning_by_bootstrap <- epds_full_stress20$tuning %>%
+  group_by(bootstrap) %>%
+  summarise(
+    any_glmnet_warning = any(glmnet_warning_n > 0),
+    min_cv_events = min(min_cv_events),
+    min_cv_unique_events = min(min_cv_unique_events),
+    .groups = "drop"
+  )
+
+epds_full_stress20$performance %>%
+  left_join(
+    warning_by_bootstrap,
+    by = "bootstrap"
+  ) %>%
+  arrange(any_glmnet_warning, bootstrap)
+
+
+```
+
+
+
+# 7. Paired baseline vs full model comparison
+
+## 7.1 Integrated Discrimination Improvement
+
+```{r}
+#| label: calculate-idi
+
+calculate_idi <- function(
+  outcome,
+  predicted_baseline,
+  predicted_full
+) {
+
+  stopifnot(
+    length(outcome) == length(predicted_baseline),
+    length(outcome) == length(predicted_full)
+  )
+
+  baseline_event_mean <-
+    mean(predicted_baseline[outcome == 1])
+
+  baseline_nonevent_mean <-
+    mean(predicted_baseline[outcome == 0])
+
+  full_event_mean <-
+    mean(predicted_full[outcome == 1])
+
+  full_nonevent_mean <-
+    mean(predicted_full[outcome == 0])
+
+  discrimination_slope_baseline <-
+    baseline_event_mean -
+    baseline_nonevent_mean
+
+  discrimination_slope_full <-
+    full_event_mean -
+    full_nonevent_mean
+
+  idi <-
+    discrimination_slope_full -
+    discrimination_slope_baseline
+
+  tibble(
+    discrimination_slope_baseline =
+      discrimination_slope_baseline,
+
+    discrimination_slope_full =
+      discrimination_slope_full,
+
+    idi = idi
+  )
+}
+```
+
+
+## 7.2 One paired bootstrap iteration
+
+```{r}
+#| label: run-one-paired-bootstrap
+
+run_one_paired_bootstrap <- function(
+  data,
+  outcome_var,
+  baseline_vars,
+  full_vars,
+  m = 3,
+  bootstrap_id = 1,
+  seed = 26092026
+) {
+
+  # ----------------------------------------------------------
+  # 1. BASELINE model
+  # ----------------------------------------------------------
+
+  baseline_result <- run_one_bootstrap(
+    data = data,
+    outcome_var = outcome_var,
+    predictor_vars = baseline_vars,
+    m = m,
+    bootstrap_id = bootstrap_id,
+    seed = seed
+  )
+
+  # ----------------------------------------------------------
+  # 2. FULL model
+  # ----------------------------------------------------------
+
+  full_result <- run_one_bootstrap(
+    data = data,
+    outcome_var = outcome_var,
+    predictor_vars = full_vars,
+    m = m,
+    bootstrap_id = bootstrap_id,
+    seed = seed
+  )
+
+  # ----------------------------------------------------------
+  # 3. Verify identical bootstrap samples
+  # ----------------------------------------------------------
+
+  stopifnot(
+    identical(
+      baseline_result$bootstrap_index,
+      full_result$bootstrap_index
+    )
+  )
+
+  stopifnot(
+    identical(
+      baseline_result$predictions$bootstrap$pid,
+      full_result$predictions$bootstrap$pid
+    )
+  )
+
+  stopifnot(
+    identical(
+      baseline_result$predictions$bootstrap$outcome,
+      full_result$predictions$bootstrap$outcome
+    )
+  )
+
+  # ----------------------------------------------------------
+  # 4. Paired change in AUC
+  # ----------------------------------------------------------
+
+  baseline_auc_bootstrap <-
+    baseline_result$performance$auc_bootstrap
+
+  full_auc_bootstrap <-
+    full_result$performance$auc_bootstrap
+
+  baseline_auc_validation <-
+    baseline_result$performance$auc_validation
+
+  full_auc_validation <-
+    full_result$performance$auc_validation
+
+  delta_auc_bootstrap <-
+    full_auc_bootstrap -
+    baseline_auc_bootstrap
+
+  delta_auc_validation <-
+    full_auc_validation -
+    baseline_auc_validation
+
+  optimism_delta_auc <-
+    delta_auc_bootstrap -
+    delta_auc_validation
+
+  # ----------------------------------------------------------
+  # 5. IDI in bootstrap development sample
+  # ----------------------------------------------------------
+
+  idi_bootstrap <- calculate_idi(
+    outcome =
+      baseline_result$predictions$bootstrap$outcome,
+
+    predicted_baseline =
+      baseline_result$predictions$bootstrap$predicted_prob,
+
+    predicted_full =
+      full_result$predictions$bootstrap$predicted_prob
+  )
+
+  # ----------------------------------------------------------
+  # 6. IDI in original validation cohort
+  # ----------------------------------------------------------
+
+  stopifnot(
+    identical(
+      baseline_result$predictions$validation$pid,
+      full_result$predictions$validation$pid
+    )
+  )
+
+  idi_validation <- calculate_idi(
+    outcome =
+      baseline_result$predictions$validation$outcome,
+
+    predicted_baseline =
+      baseline_result$predictions$validation$predicted_prob,
+
+    predicted_full =
+      full_result$predictions$validation$predicted_prob
+  )
+
+  optimism_idi <-
+    idi_bootstrap$idi -
+    idi_validation$idi
+
+  # ----------------------------------------------------------
+  # 7. Summary
+  # ----------------------------------------------------------
+
+  comparison <- tibble(
+    bootstrap = bootstrap_id,
+
+    baseline_auc_bootstrap =
+      baseline_auc_bootstrap,
+
+    full_auc_bootstrap =
+      full_auc_bootstrap,
+
+    delta_auc_bootstrap =
+      delta_auc_bootstrap,
+
+    baseline_auc_validation =
+      baseline_auc_validation,
+
+    full_auc_validation =
+      full_auc_validation,
+
+    delta_auc_validation =
+      delta_auc_validation,
+
+    optimism_delta_auc =
+      optimism_delta_auc,
+
+    baseline_discrimination_slope_bootstrap =
+      idi_bootstrap$discrimination_slope_baseline,
+
+    full_discrimination_slope_bootstrap =
+      idi_bootstrap$discrimination_slope_full,
+
+    idi_bootstrap =
+      idi_bootstrap$idi,
+
+    baseline_discrimination_slope_validation =
+      idi_validation$discrimination_slope_baseline,
+
+    full_discrimination_slope_validation =
+      idi_validation$discrimination_slope_full,
+
+    idi_validation =
+      idi_validation$idi,
+
+    optimism_idi =
+      optimism_idi
+  )
+
+  # ----------------------------------------------------------
+  # 8. Return everything needed later
+  # ----------------------------------------------------------
+
+  list(
+    comparison = comparison,
+
+    performance = bind_rows(
+      baseline_result$performance %>%
+        mutate(model = "baseline"),
+
+      full_result$performance %>%
+        mutate(model = "full")
+    ),
+
+    tuning = bind_rows(
+      baseline_result$tuning %>%
+        mutate(model = "baseline"),
+
+      full_result$tuning %>%
+        mutate(model = "full")
+    ),
+
+    coefficients = bind_rows(
+      baseline_result$coefficients %>%
+        mutate(model = "baseline"),
+
+      full_result$coefficients %>%
+        mutate(model = "full")
+    ),
+
+    diagnostics = bind_rows(
+      baseline_result$diagnostics %>%
+        mutate(model = "baseline"),
+
+      full_result$diagnostics %>%
+        mutate(model = "full")
+    ),
+
+    predictions = list(
+      baseline = baseline_result$predictions,
+      full = full_result$predictions
+    ),
+
+    bootstrap_index =
+      baseline_result$bootstrap_index
+  )
+}
+```
+
+
+
+## 7.3 Test one paired bootstrap
+```{r}
+#| label: test-one-paired-bootstrap
+
+epds_paired_test <- run_one_paired_bootstrap(
+  data = df,
+  outcome_var = "outcome_epds",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  m = 3,
+  bootstrap_id = 1,
+  seed = 26092026
+)
+```
+
+
+Diagnostics
+```{r}
+epds_paired_test$comparison
+
+epds_paired_test$diagnostics
+
+epds_paired_test$tuning %>%
+  select(
+    model,
+    bootstrap,
+    imputation,
+    alpha,
+    lambda,
+    n_selected,
+    min_cv_events,
+    glmnet_warning_n
+  )
+
+
+epds_paired_test$comparison %>%
+  select(
+    delta_auc_bootstrap,
+    delta_auc_validation,
+    optimism_delta_auc,
+    idi_bootstrap,
+    idi_validation,
+    optimism_idi
+  )
+```
+
+
+## 7.4 Build the paired-bootstrap series wrapper
+```{r}
+#| label: run-paired-bootstrap-series
+
+run_paired_bootstrap_series <- function(
+  data,
+  outcome_var,
+  baseline_vars,
+  full_vars,
+  B = 5,
+  m = 3,
+  seed = 26092026
+) {
+
+  comparison_list <- vector("list", B)
+  performance_list <- vector("list", B)
+  tuning_list <- vector("list", B)
+  coefficient_list <- vector("list", B)
+  diagnostic_list <- vector("list", B)
+
+  for (b in seq_len(B)) {
+
+    cat(
+      "\nPaired bootstrap",
+      b,
+      "of",
+      B,
+      "\n"
+    )
+
+    result_b <- run_one_paired_bootstrap(
+      data = data,
+      outcome_var = outcome_var,
+      baseline_vars = baseline_vars,
+      full_vars = full_vars,
+      m = m,
+      bootstrap_id = b,
+      seed = seed
+    )
+
+    comparison_list[[b]] <-
+      result_b$comparison
+
+    performance_list[[b]] <-
+      result_b$performance
+
+    tuning_list[[b]] <-
+      result_b$tuning
+
+    coefficient_list[[b]] <-
+      result_b$coefficients
+
+    diagnostic_list[[b]] <-
+      result_b$diagnostics
+  }
+
+  list(
+    comparison =
+      bind_rows(comparison_list),
+
+    performance =
+      bind_rows(performance_list),
+
+    tuning =
+      bind_rows(tuning_list),
+
+    coefficients =
+      bind_rows(coefficient_list),
+
+    diagnostics =
+      bind_rows(diagnostic_list)
+  )
+}
+
+
+
+```
+
+## 7.5 Test five paired bootstraps
+
+```{r}
+epds_paired_smoke5 <- run_paired_bootstrap_series(
+  data = df,
+  outcome_var = "outcome_epds",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  B = 5,
+  m = 3,
+  seed = 26092026
+)
+```
+
+Results + diagnostics 
+```{r}
+
+epds_paired_smoke5$comparison
+
+epds_paired_smoke5$diagnostics
+
+epds_paired_smoke5$tuning %>%
+  count(
+    model,
+    alpha
+  )
+
+
+epds_paired_smoke5$comparison %>%
+  select(
+    bootstrap,
+    delta_auc_bootstrap,
+    delta_auc_validation,
+    optimism_delta_auc,
+    idi_bootstrap,
+    idi_validation,
+    optimism_idi
+  )
+
+
+```
+
+
+# 8: Fit the apparent original-sample models and optimism correction.
+
+```{r}
+#| label: fit-apparent-model
+
+fit_apparent_model <- function(
+  data,
+  outcome_var,
+  predictor_vars,
+  m = 10,
+  seed = 26092026
+) {
+
+  # Development-style MICE:
+  # outcome may be used to impute missing predictors
+  apparent_spec <- make_mice_spec_development(
+    data = data,
+    outcome_var = outcome_var,
+    predictor_vars = predictor_vars
+  )
+
+  apparent_imp <- mice::mice(
+    data = apparent_spec$data,
+    m = m,
+    maxit = 20,
+    method = apparent_spec$method,
+    predictorMatrix = apparent_spec$predictor_matrix,
+    printFlag = FALSE,
+    seed = seed
+  )
+
+  prediction_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(data),
+    ncol = m
+  )
+
+  tuning_list <- vector("list", m)
+  coefficient_list <- vector("list", m)
+
+  for (j in seq_len(m)) {
+
+    data_j <- mice::complete(
+      apparent_imp,
+      j
+    )
+
+    data_j$pid <- data$pid
+
+    model_j <- fit_elastic_net(
+      train_data = data_j,
+      validation_data = data_j,
+      outcome_var = outcome_var,
+      predictor_vars = predictor_vars,
+      k = 10,
+      seed = seed
+    )
+
+    prediction_matrix[, j] <-
+      model_j$train_prediction
+
+    tuning_list[[j]] <- tibble(
+      imputation = j,
+      alpha = model_j$alpha,
+      lambda = model_j$lambda,
+      n_selected =
+        sum(model_j$coefficients$selected),
+      glmnet_warning_n =
+        model_j$glmnet_warning_n
+    )
+
+    coefficient_list[[j]] <-
+      model_j$coefficients %>%
+      mutate(imputation = j)
+  }
+
+  mean_prediction <- rowMeans(
+    prediction_matrix
+  )
+
+  auc_apparent <- as.numeric(
+    pROC::auc(
+      response = data[[outcome_var]],
+      predictor = mean_prediction,
+      quiet = TRUE
+    )
+  )
+
+  calibration_apparent <- calculate_calibration(
+    outcome = data[[outcome_var]],
+    predicted_prob = mean_prediction
+  )
+
+  list(
+    performance = tibble(
+      auc = auc_apparent,
+      calibration_intercept =
+        calibration_apparent$calibration_intercept,
+      calibration_slope =
+        calibration_apparent$calibration_slope
+    ),
+
+    predictions = tibble(
+      pid = data$pid,
+      outcome = data[[outcome_var]],
+      predicted_prob = mean_prediction
+    ),
+
+    tuning = bind_rows(tuning_list),
+    coefficients = bind_rows(coefficient_list),
+
+    mice_logged_events =
+      ifelse(
+        is.null(apparent_imp$loggedEvents),
+        0,
+        nrow(apparent_imp$loggedEvents)
+      )
+  )
+}
+```
+
+Then fit both models
+```{r}
+epds_apparent_baseline <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = baseline_vars,
+  m = 10,
+  seed = 26092026
+)
+
+epds_apparent_full <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_epds",
+  predictor_vars = full_vars,
+  m = 10,
+  seed = 26092026
+)
+```
+
+Results + diagnostics
+```{r}
+epds_apparent_baseline$performance
+
+epds_apparent_full$performance
+
+epds_apparent_baseline$mice_logged_events
+
+epds_apparent_full$mice_logged_events
+
+
+epds_apparent_delta_auc <-
+  epds_apparent_full$performance$auc -
+  epds_apparent_baseline$performance$auc
+
+epds_apparent_idi <- calculate_idi(
+  outcome = df$outcome_epds,
+
+  predicted_baseline =
+    epds_apparent_baseline$predictions$predicted_prob,
+
+  predicted_full =
+    epds_apparent_full$predictions$predicted_prob
+)
+```
+
+8 bootstrap calibration stress test
+```{r}
+
+epds_calibration_stress_test <- run_one_paired_bootstrap(
+  data = df,
+  outcome_var = "outcome_epds",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  m = 10,
+  bootstrap_id = 8,
+  seed = 26092026
+)
+```
+
+Results + diagnostics
+```{r}
+
+epds_calibration_stress_test$performance
+
+epds_calibration_stress_test$comparison
+```
+
+
+
+```{r}
+epds_calibration_stress_test$performance %>%
+  select(
+    model,
+    calibration_intercept_bootstrap,
+    calibration_intercept_validation,
+    calibration_slope_bootstrap,
+    calibration_slope_validation
+  )
+
+epds_calibration_stress_test$tuning %>%
+  summarise(
+    fits_with_glmnet_warning = sum(glmnet_warning_n > 0),
+    total_glmnet_warnings = sum(glmnet_warning_n)
+  )
+
+
+```
+
+## 8.3 Calculate optimism-corrected performance
+```{r}
+#| label: calculate-optimism-corrected-performance
+
+calculate_optimism_corrected <- function(
+  apparent_baseline,
+  apparent_full,
+  apparent_idi,
+  paired_bootstrap
+) {
+
+  # ----------------------------------------------------------
+  # 1. Mean optimism for each model
+  # ----------------------------------------------------------
+
+  model_optimism <- paired_bootstrap$performance %>%
+    group_by(model) %>%
+    summarise(
+      mean_optimism_auc =
+        mean(optimism_auc, na.rm = TRUE),
+
+      mean_optimism_calibration_intercept =
+        mean(
+          optimism_calibration_intercept,
+          na.rm = TRUE
+        ),
+
+      mean_optimism_calibration_slope =
+        mean(
+          optimism_calibration_slope,
+          na.rm = TRUE
+        ),
+
+      .groups = "drop"
+    )
+
+  # ----------------------------------------------------------
+  # 2. Apparent model performance
+  # ----------------------------------------------------------
+
+  apparent_models <- bind_rows(
+
+    apparent_baseline$performance %>%
+      mutate(model = "baseline"),
+
+    apparent_full$performance %>%
+      mutate(model = "full")
+  )
+
+  # ----------------------------------------------------------
+  # 3. Optimism-corrected model performance
+  # ----------------------------------------------------------
+
+  corrected_models <- apparent_models %>%
+    left_join(
+      model_optimism,
+      by = "model"
+    ) %>%
+    mutate(
+
+      auc_optimism_corrected =
+        auc -
+        mean_optimism_auc,
+
+      calibration_intercept_optimism_corrected =
+        calibration_intercept -
+        mean_optimism_calibration_intercept,
+
+      calibration_slope_optimism_corrected =
+        calibration_slope -
+        mean_optimism_calibration_slope
+    )
+
+  # ----------------------------------------------------------
+  # 4. Apparent incremental value
+  # ----------------------------------------------------------
+
+  apparent_delta_auc <-
+    apparent_full$performance$auc -
+    apparent_baseline$performance$auc
+
+  apparent_idi_value <-
+    apparent_idi$idi
+
+  # ----------------------------------------------------------
+  # 5. Mean optimism in incremental value
+  # ----------------------------------------------------------
+
+  mean_optimism_delta_auc <-
+    mean(
+      paired_bootstrap$comparison$optimism_delta_auc,
+      na.rm = TRUE
+    )
+
+  mean_optimism_idi <-
+    mean(
+      paired_bootstrap$comparison$optimism_idi,
+      na.rm = TRUE
+    )
+
+  # ----------------------------------------------------------
+  # 6. Optimism-corrected incremental value
+  # ----------------------------------------------------------
+
+  corrected_comparison <- tibble(
+
+    apparent_delta_auc =
+      apparent_delta_auc,
+
+    mean_optimism_delta_auc =
+      mean_optimism_delta_auc,
+
+    optimism_corrected_delta_auc =
+      apparent_delta_auc -
+      mean_optimism_delta_auc,
+
+    apparent_idi =
+      apparent_idi_value,
+
+    mean_optimism_idi =
+      mean_optimism_idi,
+
+    optimism_corrected_idi =
+      apparent_idi_value -
+      mean_optimism_idi
+  )
+
+  list(
+    model_performance = corrected_models,
+    incremental_value = corrected_comparison
+  )
+}
+```
+
+
+## 5-bootstrap epds correction smoke test
+```{r}
+epds_correction_smoke <- calculate_optimism_corrected(
+  apparent_baseline = epds_apparent_baseline,
+  apparent_full = epds_apparent_full,
+  apparent_idi = epds_apparent_idi,
+  paired_bootstrap = epds_paired_smoke5
+)
+
+epds_correction_smoke$model_performance
+
+epds_correction_smoke$incremental_value
+```
+
+
+
+## 8.5 Save apparent-model objects
+```{r}
+dir.create(
+  here("output", "derived"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+saveRDS(
+  epds_apparent_baseline,
+  here("output", "derived", "epds_apparent_baseline.rds")
+)
+
+saveRDS(
+  epds_apparent_full,
+  here("output", "derived", "epds_apparent_full.rds")
+)
+
+saveRDS(
+  epds_apparent_idi,
+  here("output", "derived", "epds_apparent_idi.rds")
+)
+```
+
+
+
+
+
+# 9. Final bootstrap analysis with checkpointing
+```{r}
+#| label: run-paired-bootstrap-checkpointed
+
+run_paired_bootstrap_checkpointed <- function(
+    data,
+    outcome_var,
+    baseline_vars,
+    full_vars,
+    output_dir,
+    outcome_label,
+    B = 1000,
+    m = 10,
+    seed = 26092026
+) {
+
+  dir.create(
+    output_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  for (b in seq_len(B)) {
+
+    output_file <- file.path(
+      output_dir,
+      sprintf(
+        "%s_bootstrap_%04d.rds",
+        tolower(outcome_label),
+        b
+      )
+    )
+
+    # --------------------------------------------------------
+    # Resume safely: never repeat an already completed bootstrap
+    # --------------------------------------------------------
+
+    if (file.exists(output_file)) {
+
+      cat(
+        outcome_label,
+        " bootstrap ",
+        b,
+        " already completed — skipping.\n",
+        sep = ""
+      )
+
+      next
+    }
+
+    cat(
+      "\n========================================\n",
+      outcome_label,
+      " bootstrap ",
+      b,
+      " of ",
+      B,
+      "\n========================================\n",
+      sep = ""
+    )
+
+    start_time <- Sys.time()
+
+    # --------------------------------------------------------
+    # Entire original paired bootstrap analysis
+    # --------------------------------------------------------
+
+    result_b <- run_one_paired_bootstrap(
+      data = data,
+      outcome_var = outcome_var,
+      baseline_vars = baseline_vars,
+      full_vars = full_vars,
+      m = m,
+      bootstrap_id = b,
+      seed = seed
+    )
+
+    # --------------------------------------------------------
+    # Verify that all required output has been retained
+    # --------------------------------------------------------
+
+    required_elements <- c(
+      "comparison",
+      "performance",
+      "tuning",
+      "coefficients",
+      "diagnostics",
+      "predictions",
+      "bootstrap_index"
+    )
+
+    stopifnot(
+      all(
+        required_elements %in%
+          names(result_b)
+      )
+    )
+
+    stopifnot(
+      all(
+        c("baseline", "full") %in%
+          names(result_b$predictions)
+      )
+    )
+
+    # Participant-level bootstrap predictions
+    stopifnot(
+      nrow(
+        result_b$
+          predictions$
+          baseline$
+          bootstrap
+      ) == nrow(data),
+
+      nrow(
+        result_b$
+          predictions$
+          full$
+          bootstrap
+      ) == nrow(data)
+    )
+
+    # Participant-level predictions when the fitted bootstrap
+    # models are evaluated in the original analytic sample
+    stopifnot(
+      nrow(
+        result_b$
+          predictions$
+          baseline$
+          validation
+      ) == nrow(data),
+
+      nrow(
+        result_b$
+          predictions$
+          full$
+          validation
+      ) == nrow(data)
+    )
+
+    # Predictions required for calibration must be complete
+    stopifnot(
+      !anyNA(
+        result_b$
+          predictions$
+          baseline$
+          bootstrap$
+          predicted_prob
+      ),
+
+      !anyNA(
+        result_b$
+          predictions$
+          baseline$
+          validation$
+          predicted_prob
+      ),
+
+      !anyNA(
+        result_b$
+          predictions$
+          full$
+          bootstrap$
+          predicted_prob
+      ),
+
+      !anyNA(
+        result_b$
+          predictions$
+          full$
+          validation$
+          predicted_prob
+      )
+    )
+
+    # --------------------------------------------------------
+    # Save the COMPLETE bootstrap result
+    #
+    # This retains:
+    #   comparison
+    #   performance
+    #   tuning
+    #   coefficients
+    #   diagnostics
+    #   participant-level predictions
+    #   bootstrap sampling indices
+    # --------------------------------------------------------
+
+    temporary_file <- paste0(
+      output_file,
+      ".tmp"
+    )
+
+    saveRDS(
+      result_b,
+      temporary_file
+    )
+
+    if (!file.rename(
+      temporary_file,
+      output_file
+    )) {
+
+      stop(
+        "Could not finalize bootstrap file: ",
+        output_file
+      )
+    }
+
+    elapsed_seconds <- as.numeric(
+      difftime(
+        Sys.time(),
+        start_time,
+        units = "secs"
+      )
+    )
+
+    cat(
+      "Saved bootstrap ",
+      b,
+      " | elapsed: ",
+      round(elapsed_seconds, 1),
+      " seconds\n",
+      sep = ""
+    )
+
+    if (b %% 10 == 0) {
+
+      completed <- length(
+        list.files(
+          output_dir,
+          pattern = "\\.rds$"
+        )
+      )
+
+      cat(
+        "Checkpoint: ",
+        completed,
+        " / ",
+        B,
+        " complete.\n",
+        sep = ""
+      )
+    }
+  }
+
+  invisible(TRUE)
+}
+```
+
+
+
+
+### Create a checkpoint folder
+```{r}
+### Define canonical bootstrap folders
+
+bootstrap_root <- here("output", "bootstrap")
+
+epds_bootstrap_output <- file.path(bootstrap_root, "epds")
+stais_bootstrap_output <- file.path(bootstrap_root, "stais")
+stait_bootstrap_output <- file.path(bootstrap_root, "stait")
+```
+
+
+
+
+#10. Final EPDS analysis
+-each of 1,000 bootstrap samples runs both baseline and full models, with 10 imputations and internal elastic-net tuning
+
+```{r}
+run_paired_bootstrap_checkpointed(
+  data = df,
+  outcome_var = "outcome_epds",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  output_dir = epds_bootstrap_output,
+  outcome_label = "EPDS",
+  B = 1000,
+  m = 10,
+  seed = 26092026
+)
+```
+
+## 10.1 Combine and save EPDS output 
+
+```{r}
+#| label: combine-epds-bootstrap-checkpoints
+
+# Put the 1,000 checkpoint files in bootstrap order
+epds_files <- epds_files[order(epds_ids)]
+epds_ids   <- sort(epds_ids)
+
+# Read all completed bootstrap objects
+epds_checkpoint_objects <- lapply(
+  epds_files,
+  readRDS
+)
+
+# ------------------------------------------------------------
+# Combine the ordinary tabular outputs
+# ------------------------------------------------------------
+
+epds_comparison <- dplyr::bind_rows(
+  lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "comparison"
+  )
+)
+
+epds_performance <- dplyr::bind_rows(
+  lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "performance"
+  )
+)
+
+epds_tuning <- dplyr::bind_rows(
+  lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "tuning"
+  )
+)
+
+epds_coefficients <- dplyr::bind_rows(
+  lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "coefficients"
+  )
+)
+
+epds_diagnostics <- dplyr::bind_rows(
+  lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "diagnostics"
+  )
+)
+
+# ------------------------------------------------------------
+# Combine participant-level predictions
+# Retain:
+#   bootstrap/full vs baseline
+#   development-bootstrap vs validation sample
+# ------------------------------------------------------------
+
+epds_predictions <- purrr::map2_dfr(
+  epds_checkpoint_objects,
+  epds_ids,
+  function(x, b) {
+
+    dplyr::bind_rows(
+
+      x$predictions$baseline$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$baseline$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "validation",
+          .before = 1
+        ),
+
+      x$predictions$full$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$full$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "validation",
+          .before = 1
+        )
+    )
+  }
+)
+
+# ------------------------------------------------------------
+# Retain the exact bootstrap sampling indices
+# as a list-column: one vector of 91 indices per bootstrap
+# ------------------------------------------------------------
+
+epds_bootstrap_indices <- tibble::tibble(
+  bootstrap = epds_ids,
+  bootstrap_index = lapply(
+    epds_checkpoint_objects,
+    `[[`,
+    "bootstrap_index"
+  )
+)
+
+# ------------------------------------------------------------
+# Canonical combined EPDS object
+# ------------------------------------------------------------
+
+epds_final_bootstrap <- list(
+  comparison = epds_comparison,
+  performance = epds_performance,
+  tuning = epds_tuning,
+  coefficients = epds_coefficients,
+  diagnostics = epds_diagnostics,
+  predictions = epds_predictions,
+  bootstrap_indices = epds_bootstrap_indices
+)
+
+# Save WITHOUT deleting the 1,000 individual checkpoint files
+saveRDS(
+  epds_final_bootstrap,
+  file.path(
+    epds_bootstrap_output,
+    "epds_bootstrap_combined_1000x10.rds"
+  )
+)
+```
+
+## 10.2 Checks + Diagnostics 
+
+```{r}
+
+cat("Comparison rows:", nrow(epds_final_bootstrap$comparison), "\n")
+cat("Performance rows:", nrow(epds_final_bootstrap$performance), "\n")
+cat("Tuning rows:", nrow(epds_final_bootstrap$tuning), "\n")
+cat("Diagnostics rows:", nrow(epds_final_bootstrap$diagnostics), "\n")
+cat("Prediction rows:", nrow(epds_final_bootstrap$predictions), "\n")
+cat("Bootstrap-index rows:", nrow(epds_final_bootstrap$bootstrap_indices), "\n")
+
+cat(
+  "Missing prediction probabilities:",
+  sum(is.na(epds_final_bootstrap$predictions$predicted_prob)),
+  "\n"
+)
+
+epds_final_bootstrap$predictions %>%
+  count(model, sample)
+
+
+epds_final_results_new <- calculate_optimism_corrected(
+  apparent_baseline = epds_apparent_baseline,
+  apparent_full = epds_apparent_full,
+  apparent_idi = epds_apparent_idi,
+  paired_bootstrap = epds_final_bootstrap
+)
+
+epds_final_results_new$model_performance
+
+epds_final_results_new$incremental_value
+
+
+
+```
+
+
+
+## 10.3 EPDS coefficient-selection stability
+
+```{r}
+
+#| label: verify-epds-selection-stability
+
+epds_selection_by_bootstrap_new <-
+  epds_final_bootstrap$coefficients %>%
+  group_by(
+    model,
+    bootstrap,
+    variable
+  ) %>%
+  summarise(
+    n_selected = sum(selected),
+
+    proportion_imputations_selected =
+      mean(selected),
+
+    n_positive =
+      sum(selected & coefficient > 0),
+
+    n_negative =
+      sum(selected & coefficient < 0),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Majority = selected in at least 5 of 10 imputations
+    majority_selected =
+      n_selected >= 5,
+
+    predominant_direction =
+      case_when(
+        n_positive > n_negative ~ "positive",
+        n_negative > n_positive ~ "negative",
+        TRUE ~ "mixed"
+      )
+  )
+
+
+epds_bootstrap_stability_new <-
+  epds_selection_by_bootstrap_new %>%
+  group_by(
+    model,
+    variable
+  ) %>%
+  summarise(
+    mean_imputation_selection =
+      mean(proportion_imputations_selected),
+
+    bootstrap_majority_frequency =
+      mean(majority_selected),
+
+    n_bootstraps_majority_selected =
+      sum(majority_selected),
+
+    positive_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "positive"
+      ),
+
+    negative_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "negative"
+      ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    predominant_bootstrap_direction =
+      case_when(
+        positive_when_majority_selected >
+          negative_when_majority_selected ~ "positive",
+
+        negative_when_majority_selected >
+          positive_when_majority_selected ~ "negative",
+
+        TRUE ~ "mixed"
+      ),
+
+    bootstrap_direction_consistency =
+      if_else(
+        n_bootstraps_majority_selected > 0,
+
+        pmax(
+          positive_when_majority_selected,
+          negative_when_majority_selected
+        ) /
+          n_bootstraps_majority_selected,
+
+        NA_real_
+      )
+  ) %>%
+  arrange(
+    model,
+    desc(bootstrap_majority_frequency)
+  )
+
+
+epds_pd_bootstrap_stability_new <-
+  epds_bootstrap_stability_new %>%
+  filter(
+    model == "full",
+    variable %in% pd_vars
+  ) %>%
+  arrange(
+    desc(bootstrap_majority_frequency)
+  )
+
+epds_pd_bootstrap_stability_new
+```
+
+
+## 10.4 Quantify resampling variability of ΔAUC and IDI
+
+```{r}
+
+epds_incremental_variability <-
+  epds_final_bootstrap$comparison %>%
+  summarise(
+    delta_auc_validation_mean =
+      mean(delta_auc_validation),
+
+    delta_auc_validation_median =
+      median(delta_auc_validation),
+
+    delta_auc_validation_p025 =
+      quantile(delta_auc_validation, 0.025),
+
+    delta_auc_validation_p975 =
+      quantile(delta_auc_validation, 0.975),
+
+    proportion_delta_auc_positive =
+      mean(delta_auc_validation > 0),
+
+    idi_validation_mean =
+      mean(idi_validation),
+
+    idi_validation_median =
+      median(idi_validation),
+
+    idi_validation_p025 =
+      quantile(idi_validation, 0.025),
+
+    idi_validation_p975 =
+      quantile(idi_validation, 0.975),
+
+    proportion_idi_positive =
+      mean(idi_validation > 0)
+  )
+
+epds_incremental_variability
+
+epds_optimism_variability <-
+  epds_final_bootstrap$comparison %>%
+  summarise(
+    optimism_delta_auc_mean =
+      mean(optimism_delta_auc),
+
+    optimism_delta_auc_p025 =
+      quantile(optimism_delta_auc, 0.025),
+
+    optimism_delta_auc_p975 =
+      quantile(optimism_delta_auc, 0.975),
+
+    optimism_idi_mean =
+      mean(optimism_idi),
+
+    optimism_idi_p025 =
+      quantile(optimism_idi, 0.025),
+
+    optimism_idi_p975 =
+      quantile(optimism_idi, 0.975)
+  )
+
+epds_optimism_variability
+
+
+
+```
+
+## 10.5 EPSD calibration curves 
+```{r}
+## EPDS optimism-corrected calibration curves
+
+estimate_calibration_curve <- function(
+  outcome,
+  predicted_prob,
+  grid,
+  f = 2/3
+) {
+
+  keep <-
+    !is.na(outcome) &
+    is.finite(predicted_prob)
+
+  x <- as.numeric(predicted_prob[keep])
+  y <- as.numeric(outcome[keep])
+
+  # Protect against a degenerate prediction vector
+  if (dplyr::n_distinct(x) < 2) {
+    return(
+      tibble(
+        predicted_prob = grid,
+        observed_prob = NA_real_
+      )
+    )
+  }
+
+  smooth_fit <- stats::lowess(
+    x = x,
+    y = y,
+    f = f,
+    iter = 0
+  )
+
+  # Interpolate the LOWESS estimate onto a common probability grid.
+  # rule = 1 avoids extrapolation outside the observed prediction range.
+  observed_grid <- stats::approx(
+    x = smooth_fit$x,
+    y = smooth_fit$y,
+    xout = grid,
+    rule = 1,
+    ties = mean
+  )$y
+
+  tibble(
+    predicted_prob = grid,
+    observed_prob = pmin(
+      pmax(observed_grid, 0),
+      1
+    )
+  )
+}
+
+
+
+epds_calibration_grids <- list(
+
+  baseline = seq(
+    quantile(
+      epds_apparent_baseline$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      epds_apparent_baseline$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  ),
+
+  full = seq(
+    quantile(
+      epds_apparent_full$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      epds_apparent_full$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  )
+)
+
+
+# Calculate the two calibration curves
+epds_apparent_calibration_curves <-
+  bind_rows(
+
+    estimate_calibration_curve(
+      outcome =
+        epds_apparent_baseline$predictions$outcome,
+      predicted_prob =
+        epds_apparent_baseline$predictions$predicted_prob,
+      grid =
+        epds_calibration_grids$baseline
+    ) %>%
+      mutate(model = "baseline", .before = 1),
+
+    estimate_calibration_curve(
+      outcome =
+        epds_apparent_full$predictions$outcome,
+      predicted_prob =
+        epds_apparent_full$predictions$predicted_prob,
+      grid =
+        epds_calibration_grids$full
+    ) %>%
+      mutate(model = "full", .before = 1)
+  )
+
+epds_apparent_calibration_curves
+
+
+```
+
+### 10-bootstrap smoke test
+```{r}
+epds_calibration_smoke <-
+  purrr::map_dfr(
+    c("baseline", "full"),
+    function(model_name) {
+
+      grid <-
+        epds_calibration_grids[[model_name]]
+
+      purrr::map_dfr(
+        1:10,
+        function(b) {
+
+          bootstrap_predictions <-
+            epds_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "bootstrap"
+            )
+
+          validation_predictions <-
+            epds_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "validation"
+            )
+
+          bootstrap_curve <-
+            estimate_calibration_curve(
+              outcome =
+                bootstrap_predictions$outcome,
+              predicted_prob =
+                bootstrap_predictions$predicted_prob,
+              grid = grid
+            )
+
+          validation_curve <-
+            estimate_calibration_curve(
+              outcome =
+                validation_predictions$outcome,
+              predicted_prob =
+                validation_predictions$predicted_prob,
+              grid = grid
+            )
+
+          tibble(
+            bootstrap = b,
+            model = model_name,
+            predicted_prob = grid,
+            calibration_bootstrap =
+              bootstrap_curve$observed_prob,
+            calibration_validation =
+              validation_curve$observed_prob,
+            optimism =
+              calibration_bootstrap -
+              calibration_validation
+          )
+        }
+      )
+    }
+  )
+
+
+epds_calibration_smoke %>%
+  group_by(model) %>%
+  summarise(
+    rows = n(),
+    usable_optimism_values =
+      sum(!is.na(optimism)),
+    missing_optimism_values =
+      sum(is.na(optimism))
+  )
+```
+
+## 10.6 Calculate calibration optimism for all 1,000 bootstraps
+```{r}
+#| label: epds-bootstrap-calibration-curves
+
+epds_calibration_bootstrap <-
+  purrr::map_dfr(
+    c("baseline", "full"),
+    function(model_name) {
+
+      grid <-
+        epds_calibration_grids[[model_name]]
+
+      purrr::map_dfr(
+        1:1000,
+        function(b) {
+
+          bootstrap_predictions <-
+            epds_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "bootstrap"
+            )
+
+          validation_predictions <-
+            epds_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "validation"
+            )
+
+          bootstrap_curve <-
+            estimate_calibration_curve(
+              outcome =
+                bootstrap_predictions$outcome,
+              predicted_prob =
+                bootstrap_predictions$predicted_prob,
+              grid = grid
+            )
+
+          validation_curve <-
+            estimate_calibration_curve(
+              outcome =
+                validation_predictions$outcome,
+              predicted_prob =
+                validation_predictions$predicted_prob,
+              grid = grid
+            )
+
+          tibble(
+            bootstrap = b,
+            model = model_name,
+            predicted_prob = grid,
+
+            calibration_bootstrap =
+              bootstrap_curve$observed_prob,
+
+            calibration_validation =
+              validation_curve$observed_prob,
+
+            optimism =
+              calibration_bootstrap -
+              calibration_validation
+          )
+        }
+      )
+    }
+  )
+
+# Checks
+nrow(epds_calibration_bootstrap)
+
+epds_calibration_bootstrap %>%
+  count(model)
+
+
+#
+```
+
+### Save EPDS cal bootstrap
+```{r}
+saveRDS(
+  epds_calibration_bootstrap,
+  file.path(
+    epds_bootstrap_output,
+    "epds_calibration_bootstrap_curves.rds"
+  )
+)
+```
+
+
+### Calculate pointwise mean optimism
+```{r}
+epds_calibration_optimism <-
+  epds_calibration_bootstrap %>%
+  group_by(
+    model,
+    predicted_prob
+  ) %>%
+  summarise(
+    mean_optimism =
+      mean(optimism, na.rm = TRUE),
+
+    n_contributing =
+      sum(!is.na(optimism)),
+
+    .groups = "drop"
+  )
+
+epds_calibration_optimism %>%
+  group_by(model) %>%
+  summarise(
+    min_contributing = min(n_contributing),
+    median_contributing = median(n_contributing),
+    max_contributing = max(n_contributing)
+  )
+```
+
+### Construct the optimism-corrected curve
+```{r}
+
+##combine the apparent curve with the mean pointwise optimism
+
+epds_calibration_corrected <-
+  epds_apparent_calibration_curves %>%
+  left_join(
+    epds_calibration_optimism,
+    by = c(
+      "model",
+      "predicted_prob"
+    )
+  ) %>%
+  mutate(
+    corrected_observed_prob_raw =
+      observed_prob - mean_optimism,
+
+    # Keep the raw value for transparency,
+    # but constrain the plotted probability to [0, 1]
+    corrected_observed_prob =
+      pmin(
+        pmax(
+          corrected_observed_prob_raw,
+          0
+        ),
+        1
+      ),
+
+    proportion_bootstraps_contributing =
+      n_contributing / 1000
+  )
+
+
+epds_calibration_corrected %>%
+  group_by(model) %>%
+  summarise(
+    min_support =
+      min(proportion_bootstraps_contributing),
+
+    median_support =
+      median(proportion_bootstraps_contributing),
+
+    max_support =
+      max(proportion_bootstraps_contributing),
+
+    n_raw_below_zero =
+      sum(corrected_observed_prob_raw < 0),
+
+    n_raw_above_one =
+      sum(corrected_observed_prob_raw > 1)
+  )
+```
+
+### Checking ranges
+```{r}
+epds_calibration_support_ranges <-
+  epds_calibration_corrected %>%
+  group_by(model) %>%
+  summarise(
+    apparent_min = min(predicted_prob),
+    apparent_max = max(predicted_prob),
+
+    min_90 = min(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.90
+      ]
+    ),
+
+    max_90 = max(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.90
+      ]
+    ),
+
+    min_80 = min(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.80
+      ]
+    ),
+
+    max_80 = max(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.80
+      ]
+    ),
+
+    .groups = "drop"
+  )
+
+epds_calibration_support_ranges
+
+
+
+epds_calibration_corrected %>%
+  group_by(model) %>%
+  slice_min(
+    proportion_bootstraps_contributing,
+    n = 10
+  ) %>%
+  select(
+    model,
+    predicted_prob,
+    n_contributing,
+    proportion_bootstraps_contributing
+  )
+```
+
+
+
+### create the EPDS calibration figure
+```{r}
+#| label: epds-calibration-plot-data
+
+epds_calibration_plot_data <-
+  epds_calibration_corrected %>%
+  filter(
+    proportion_bootstraps_contributing >= 0.80
+  ) %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    )
+  )
+
+
+
+epds_calibration_labels <-
+  epds_final_results_new$model_performance %>%
+  transmute(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    ),
+
+    label = sprintf(
+      "Calibration intercept = %.2f\nCalibration slope = %.2f",
+      calibration_intercept_optimism_corrected,
+      calibration_slope_optimism_corrected
+    )
+  )
+
+#| label: epds-calibration-figure
+
+epds_calibration_plot <-
+  ggplot(
+    epds_calibration_plot_data,
+    aes(x = predicted_prob)
+  ) +
+
+  # Perfect calibration
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dotted",
+    linewidth = 0.7
+  ) +
+
+  # Apparent calibration
+  geom_line(
+    aes(
+      y = observed_prob,
+      linetype = "Apparent"
+    ),
+    linewidth = 0.9
+  ) +
+
+  # Optimism-corrected calibration
+  geom_line(
+    aes(
+      y = corrected_observed_prob,
+      linetype = "Optimism-corrected"
+    ),
+    linewidth = 1.1
+  ) +
+
+  facet_wrap(
+    ~ model,
+    nrow = 1
+  ) +
+
+ geom_text(
+  data = epds_calibration_labels,
+  aes(
+    x = -Inf,
+    y = Inf,
+    label = label
+  ),
+  inherit.aes = FALSE,
+  hjust = -0.05,
+  vjust = 1.2,
+  size = 3.5
+) +
+
+  coord_equal() +
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "Apparent" = "dashed",
+      "Optimism-corrected" = "solid"
+    )
+  ) +
+
+  labs(
+    x = "Predicted probability",
+    y = "Observed probability",
+    caption =
+      "Curves are displayed where ≥80% of bootstrap resamples contributed to the optimism estimate. Dotted line indicates perfect calibration."
+  ) +
+
+  theme_classic() +
+
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+epds_calibration_plot
+```
+
+### Save plot and data
+```{r}
+readr::write_csv(
+  epds_calibration_plot_data,
+  file.path(
+    epds_bootstrap_output,
+    "epds_calibration_plot_data.csv"
+  )
+)
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "epds_calibration.png"
+  ),
+  plot = epds_calibration_plot,
+  width = 8,
+  height = 4.5,
+  dpi = 300
+)
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "epds_calibration.pdf"
+  ),
+  plot = epds_calibration_plot,
+  width = 8,
+  height = 4.5
+)
+```
+
+
+## 10.7 Save and export the EPDS summary objects
+
+```{r}
+
+epds_final_results <- epds_final_results_new
+epds_bootstrap_stability <- epds_bootstrap_stability_new
+epds_pd_bootstrap_stability <- epds_pd_bootstrap_stability_new
+
+## Save final EPDS summary objects
+
+saveRDS(
+  epds_final_results,
+  here("output", "derived", "epds_final_results.rds")
+)
+
+saveRDS(
+  epds_bootstrap_stability,
+  here("output", "derived", "epds_bootstrap_stability.rds")
+)
+
+saveRDS(
+  epds_pd_bootstrap_stability,
+  here("output", "derived", "epds_pd_bootstrap_stability.rds")
+)
+
+saveRDS(
+  epds_incremental_variability,
+  here("output", "derived", "epds_incremental_variability.rds")
+)
+
+saveRDS(
+  epds_optimism_variability,
+  here("output", "derived", "epds_optimism_variability.rds")
+)
+
+
+## Export manuscript-ready tables
+
+readr::write_csv(
+  epds_final_results$model_performance,
+  here("output", "tables", "epds_model_performance.csv")
+)
+
+readr::write_csv(
+  epds_final_results$incremental_value,
+  here("output", "tables", "epds_incremental_value.csv")
+)
+
+readr::write_csv(
+  epds_bootstrap_stability,
+  here("output", "tables", "epds_bootstrap_stability.csv")
+)
+
+readr::write_csv(
+  epds_pd_bootstrap_stability,
+  here("output", "tables", "epds_pd_bootstrap_stability.csv")
+)
+
+readr::write_csv(
+  epds_incremental_variability,
+  here("output", "tables", "epds_incremental_variability.csv")
+)
+
+saveRDS(
+  epds_calibration_optimism,
+  file.path(
+    epds_bootstrap_output,
+    "epds_calibration_optimism.rds"
+  )
+)
+
+readr::write_csv(
+  epds_calibration_support_ranges,
+  file.path(
+    epds_bootstrap_output,
+    "epds_calibration_support_ranges.csv"
+  )
+)
+
+```
+
+
+
+# 11. STAI-S analysis
+
+## 11.1 Apparent STAI-S models
+```{r}
+
+stais_apparent_baseline <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_stai_s",
+  predictor_vars = baseline_vars,
+  m = 10,
+  seed = 26092026
+)
+
+stais_apparent_full <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_stai_s",
+  predictor_vars = full_vars,
+  m = 10,
+  seed = 26092026
+)
+
+
+# Checks
+stais_apparent_baseline$performance
+stais_apparent_full$performance
+
+stais_apparent_baseline$mice_logged_events
+stais_apparent_full$mice_logged_events
+
+
+# calculate apparent ΔAUC and IDI
+
+
+stais_apparent_delta_auc <-
+  stais_apparent_full$performance$auc -
+  stais_apparent_baseline$performance$auc
+
+stais_apparent_idi <- calculate_idi(
+  outcome = df$outcome_stai_s,
+  predicted_baseline =
+    stais_apparent_baseline$predictions$predicted_prob,
+  predicted_full =
+    stais_apparent_full$predictions$predicted_prob
+)
+
+stais_apparent_delta_auc
+stais_apparent_idi
+
+```
+
+
+
+## 11.2 STAI-S smoke test with 10 bootstraps
+```{r}
+stais_smoke10 <- run_paired_bootstrap_series(
+  data = df,
+  outcome_var = "outcome_stai_s",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  B = 10,
+  m = 10,
+  seed = 26092026
+)
+
+
+# Checks
+
+stais_smoke10$diagnostics %>%
+  summarise(
+    dev_mice_events = sum(dev_mice_logged_events),
+    val_mice_events = sum(val_mice_logged_events)
+  )
+
+
+stais_smoke10$comparison %>%
+  summarise(
+    missing_delta_auc = sum(is.na(delta_auc_validation)),
+    missing_idi = sum(is.na(idi_validation))
+  )
+
+
+```
+
+## 11.3 Save apparent STAI-S models 
+
+```{r}
+
+saveRDS(
+  stais_apparent_baseline,
+  here("output", "derived", "stais_apparent_baseline.rds")
+)
+
+saveRDS(
+  stais_apparent_full,
+  here("output", "derived", "stais_apparent_full.rds")
+)
+
+saveRDS(
+  stais_apparent_idi,
+  here("output", "derived", "stais_apparent_idi.rds")
+)
+
+
+```
+
+
+
+## 11.3 Final STAI-S analysis with a new checkpoint
+
+```{r}
+run_paired_bootstrap_checkpointed(
+  data = df,
+  outcome_var = "outcome_stai_s",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  output_dir = stais_bootstrap_output,
+  outcome_label = "STAIS",
+  B = 1000,
+  m = 10,
+  seed = 26092026
+)
+
+```
+
+
+
+
+
+
+## 11.4 Checks and diagnostics 
+```{r}
+
+## STAI-S post-bootstrap verification
+
+stais_files <- list.files(
+  stais_bootstrap_output,
+  pattern = "^stais_bootstrap_[0-9]{4}\\.rds$",
+  full.names = TRUE
+)
+
+stais_ids <- as.integer(
+  sub(
+    ".*_([0-9]{4})\\.rds$",
+    "\\1",
+    basename(stais_files)
+  )
+)
+
+cat("Number of completed files:", length(stais_files), "\n")
+cat("Missing bootstrap IDs:", setdiff(1:1000, stais_ids), "\n")
+cat("Duplicated IDs:", anyDuplicated(stais_ids), "\n")
+
+tmp_files <- list.files(
+  stais_bootstrap_output,
+  pattern = "\\.tmp$",
+  full.names = TRUE
+)
+
+cat("Temporary files remaining:", length(tmp_files), "\n")
+
+
+cat("Only continue if that shows 1000 files, no missing IDs, no duplicates, no .tmp files.")
+
+```
+
+
+## 11.5 Combine the 1,000 checkpoint files
+```{r}
+## Combine canonical STAI-S bootstrap checkpoints
+
+stais_files <- stais_files[order(stais_ids)]
+stais_ids <- sort(stais_ids)
+
+stais_checkpoint_objects <- lapply(
+  stais_files,
+  readRDS
+)
+
+stais_comparison <- dplyr::bind_rows(
+  lapply(stais_checkpoint_objects, `[[`, "comparison")
+)
+
+stais_performance <- dplyr::bind_rows(
+  lapply(stais_checkpoint_objects, `[[`, "performance")
+)
+
+stais_tuning <- dplyr::bind_rows(
+  lapply(stais_checkpoint_objects, `[[`, "tuning")
+)
+
+stais_coefficients <- dplyr::bind_rows(
+  lapply(stais_checkpoint_objects, `[[`, "coefficients")
+)
+
+stais_diagnostics <- dplyr::bind_rows(
+  lapply(stais_checkpoint_objects, `[[`, "diagnostics")
+)
+
+stais_predictions <- purrr::map2_dfr(
+  stais_checkpoint_objects,
+  stais_ids,
+  function(x, b) {
+
+    dplyr::bind_rows(
+
+      x$predictions$baseline$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$baseline$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "validation",
+          .before = 1
+        ),
+
+      x$predictions$full$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$full$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "validation",
+          .before = 1
+        )
+    )
+  }
+)
+
+stais_bootstrap_indices <- tibble::tibble(
+  bootstrap = stais_ids,
+  bootstrap_index = lapply(
+    stais_checkpoint_objects,
+    `[[`,
+    "bootstrap_index"
+  )
+)
+
+stais_final_bootstrap <- list(
+  comparison = stais_comparison,
+  performance = stais_performance,
+  tuning = stais_tuning,
+  coefficients = stais_coefficients,
+  diagnostics = stais_diagnostics,
+  predictions = stais_predictions,
+  bootstrap_indices = stais_bootstrap_indices
+)
+
+saveRDS(
+  stais_final_bootstrap,
+  file.path(
+    stais_bootstrap_output,
+    "stais_bootstrap_combined_1000x10.rds"
+  )
+)
+
+
+## Verify
+cat("Comparison rows:", nrow(stais_final_bootstrap$comparison), "\n")
+cat("Performance rows:", nrow(stais_final_bootstrap$performance), "\n")
+cat("Tuning rows:", nrow(stais_final_bootstrap$tuning), "\n")
+cat("Diagnostics rows:", nrow(stais_final_bootstrap$diagnostics), "\n")
+cat("Prediction rows:", nrow(stais_final_bootstrap$predictions), "\n")
+cat("Bootstrap-index rows:", nrow(stais_final_bootstrap$bootstrap_indices), "\n")
+
+cat(
+  "Missing prediction probabilities:",
+  sum(is.na(stais_final_bootstrap$predictions$predicted_prob)),
+  "\n"
+)
+
+stais_final_bootstrap$predictions %>%
+  count(model, sample)
+
+# Expected prediction rows: 364,000
+```
+
+## 11.6  Recalculate and verify final scalar results
+
+```{r}
+stais_final_results_new <- calculate_optimism_corrected(
+  apparent_baseline = stais_apparent_baseline,
+  apparent_full = stais_apparent_full,
+  apparent_idi = stais_apparent_idi,
+  paired_bootstrap = stais_final_bootstrap
+)
+
+stais_final_results_new$model_performance
+stais_final_results_new$incremental_value
+
+
+### Expected
+# Baseline corrected AUC: 0.856953
+# Full corrected AUC:     0.814630
+# 
+# Baseline corrected calibration intercept: 0.149344
+# Full corrected calibration intercept:     0.157634
+# 
+# Baseline corrected calibration slope: 0.744293
+# Full corrected calibration slope:     0.298958
+# 
+# Corrected ΔAUC: -0.042323
+# Corrected IDI:  -0.091492
+```
+
+### If those match, promote the verified results:
+```{r}
+stais_final_results <- stais_final_results_new
+```
+
+## 11.7 Recalculate incremental-value variability
+```{r}
+stais_incremental_variability <-
+  stais_final_bootstrap$comparison %>%
+  summarise(
+    delta_auc_validation_mean =
+      mean(delta_auc_validation),
+
+    delta_auc_validation_median =
+      median(delta_auc_validation),
+
+    delta_auc_validation_p025 =
+      quantile(delta_auc_validation, 0.025),
+
+    delta_auc_validation_p975 =
+      quantile(delta_auc_validation, 0.975),
+
+    proportion_delta_auc_positive =
+      mean(delta_auc_validation > 0),
+
+    idi_validation_mean =
+      mean(idi_validation),
+
+    idi_validation_median =
+      median(idi_validation),
+
+    idi_validation_p025 =
+      quantile(idi_validation, 0.025),
+
+    idi_validation_p975 =
+      quantile(idi_validation, 0.975),
+
+    proportion_idi_positive =
+      mean(idi_validation > 0)
+  )
+
+stais_incremental_variability
+
+
+stais_optimism_variability <-
+  stais_final_bootstrap$comparison %>%
+  summarise(
+    optimism_delta_auc_mean =
+      mean(optimism_delta_auc),
+
+    optimism_delta_auc_p025 =
+      quantile(optimism_delta_auc, 0.025),
+
+    optimism_delta_auc_p975 =
+      quantile(optimism_delta_auc, 0.975),
+
+    optimism_idi_mean =
+      mean(optimism_idi),
+
+    optimism_idi_p025 =
+      quantile(optimism_idi, 0.025),
+
+    optimism_idi_p975 =
+      quantile(optimism_idi, 0.975)
+  )
+
+stais_optimism_variability
+```
+
+
+## 11.8 Recalculate selection stability
+```{r}
+stais_selection_by_bootstrap <-
+  stais_final_bootstrap$coefficients %>%
+  group_by(
+    model,
+    bootstrap,
+    variable
+  ) %>%
+  summarise(
+    n_selected = sum(selected),
+
+    proportion_imputations_selected =
+      mean(selected),
+
+    n_positive =
+      sum(selected & coefficient > 0),
+
+    n_negative =
+      sum(selected & coefficient < 0),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    majority_selected =
+      n_selected >= 5,
+
+    predominant_direction =
+      case_when(
+        n_positive > n_negative ~ "positive",
+        n_negative > n_positive ~ "negative",
+        TRUE ~ "mixed"
+      )
+  )
+
+
+stais_bootstrap_stability <-
+  stais_selection_by_bootstrap %>%
+  group_by(
+    model,
+    variable
+  ) %>%
+  summarise(
+    mean_imputation_selection =
+      mean(proportion_imputations_selected),
+
+    bootstrap_majority_frequency =
+      mean(majority_selected),
+
+    n_bootstraps_majority_selected =
+      sum(majority_selected),
+
+    positive_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "positive"
+      ),
+
+    negative_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "negative"
+      ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    predominant_bootstrap_direction =
+      case_when(
+        positive_when_majority_selected >
+          negative_when_majority_selected ~ "positive",
+
+        negative_when_majority_selected >
+          positive_when_majority_selected ~ "negative",
+
+        TRUE ~ "mixed"
+      ),
+
+    bootstrap_direction_consistency =
+      if_else(
+        n_bootstraps_majority_selected > 0,
+
+        pmax(
+          positive_when_majority_selected,
+          negative_when_majority_selected
+        ) /
+          n_bootstraps_majority_selected,
+
+        NA_real_
+      )
+  ) %>%
+  arrange(
+    model,
+    desc(bootstrap_majority_frequency)
+  )
+
+
+stais_pd_bootstrap_stability <-
+  stais_bootstrap_stability %>%
+  filter(
+    model == "full",
+    variable %in% pd_vars
+  ) %>%
+  arrange(
+    desc(bootstrap_majority_frequency)
+  )
+
+stais_pd_bootstrap_stability
+```
+
+## 11.9 STAI-S optimism-corrected calibration curves
+```{r}
+stais_calibration_grids <- list(
+
+  baseline = seq(
+    quantile(
+      stais_apparent_baseline$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      stais_apparent_baseline$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  ),
+
+  full = seq(
+    quantile(
+      stais_apparent_full$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      stais_apparent_full$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  )
+)
+
+#Apparent curves
+stais_apparent_calibration_curves <-
+  bind_rows(
+
+    estimate_calibration_curve(
+      outcome =
+        stais_apparent_baseline$predictions$outcome,
+      predicted_prob =
+        stais_apparent_baseline$predictions$predicted_prob,
+      grid =
+        stais_calibration_grids$baseline
+    ) %>%
+      mutate(model = "baseline", .before = 1),
+
+    estimate_calibration_curve(
+      outcome =
+        stais_apparent_full$predictions$outcome,
+      predicted_prob =
+        stais_apparent_full$predictions$predicted_prob,
+      grid =
+        stais_calibration_grids$full
+    ) %>%
+      mutate(model = "full", .before = 1)
+  )
+
+
+## 1000 bootstrap curves
+stais_calibration_bootstrap <-
+  purrr::map_dfr(
+    c("baseline", "full"),
+    function(model_name) {
+
+      grid <-
+        stais_calibration_grids[[model_name]]
+
+      purrr::map_dfr(
+        1:1000,
+        function(b) {
+
+          bootstrap_predictions <-
+            stais_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "bootstrap"
+            )
+
+          validation_predictions <-
+            stais_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "validation"
+            )
+
+          bootstrap_curve <-
+            estimate_calibration_curve(
+              outcome =
+                bootstrap_predictions$outcome,
+              predicted_prob =
+                bootstrap_predictions$predicted_prob,
+              grid = grid
+            )
+
+          validation_curve <-
+            estimate_calibration_curve(
+              outcome =
+                validation_predictions$outcome,
+              predicted_prob =
+                validation_predictions$predicted_prob,
+              grid = grid
+            )
+
+          tibble(
+            bootstrap = b,
+            model = model_name,
+            predicted_prob = grid,
+
+            calibration_bootstrap =
+              bootstrap_curve$observed_prob,
+
+            calibration_validation =
+              validation_curve$observed_prob,
+
+            optimism =
+              calibration_bootstrap -
+              calibration_validation
+          )
+        }
+      )
+    }
+  )
+
+
+
+```
+
+
+### Save
+```{r}
+saveRDS(
+  stais_calibration_bootstrap,
+  file.path(
+    stais_bootstrap_output,
+    "stais_calibration_bootstrap_curves.rds"
+  )
+)
+```
+
+
+## 11.10 Calculate the corrected curve and support
+```{r}
+stais_calibration_optimism <-
+  stais_calibration_bootstrap %>%
+  group_by(
+    model,
+    predicted_prob
+  ) %>%
+  summarise(
+    mean_optimism =
+      mean(optimism, na.rm = TRUE),
+
+    n_contributing =
+      sum(!is.na(optimism)),
+
+    .groups = "drop"
+  )
+```
+
+
+## 11.12 Construct corrected curves:
+```{r}
+stais_calibration_corrected <-
+  stais_apparent_calibration_curves %>%
+  left_join(
+    stais_calibration_optimism,
+    by = c(
+      "model",
+      "predicted_prob"
+    )
+  ) %>%
+  mutate(
+    corrected_observed_prob_raw =
+      observed_prob - mean_optimism,
+
+    corrected_observed_prob =
+      pmin(
+        pmax(
+          corrected_observed_prob_raw,
+          0
+        ),
+        1
+      ),
+
+    proportion_bootstraps_contributing =
+      n_contributing / 1000
+  )
+
+saveRDS(
+  stais_calibration_corrected,
+  file.path(
+    stais_bootstrap_output,
+    "stais_calibration_corrected_curve.rds"
+  )
+)
+```
+
+## 11.13 inspect support before plotting:
+```{r}
+stais_calibration_support_ranges <-
+  stais_calibration_corrected %>%
+  group_by(model) %>%
+  summarise(
+    apparent_min = min(predicted_prob),
+    apparent_max = max(predicted_prob),
+
+    min_90 = min(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.90
+      ]
+    ),
+
+    max_90 = max(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.90
+      ]
+    ),
+
+    min_80 = min(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.80
+      ]
+    ),
+
+    max_80 = max(
+      predicted_prob[
+        proportion_bootstraps_contributing >= 0.80
+      ]
+    ),
+
+    .groups = "drop"
+  )
+
+stais_calibration_support_ranges
+```
+
+## 11.13 Set up plots
+```{r}
+## STAI-S calibration plot data
+
+stais_calibration_plot_data <-
+  stais_calibration_corrected %>%
+  filter(
+    proportion_bootstraps_contributing >= 0.80
+  ) %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    )
+  )
+
+
+### create corrected labels
+stais_calibration_labels <-
+  stais_final_results$model_performance %>%
+  transmute(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    ),
+
+    label = sprintf(
+      "Calibration intercept = %.2f\nCalibration slope = %.2f",
+      calibration_intercept_optimism_corrected,
+      calibration_slope_optimism_corrected
+    )
+  )
+
+stais_calibration_labels
+
+
+```
+
+
+## 11.14 Plot curves
+```{r}
+stais_calibration_plot <-
+  ggplot(
+    stais_calibration_plot_data,
+    aes(x = predicted_prob)
+  ) +
+
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dotted",
+    linewidth = 0.7
+  ) +
+
+  geom_line(
+    aes(
+      y = observed_prob,
+      linetype = "Apparent"
+    ),
+    linewidth = 0.9
+  ) +
+
+  geom_line(
+    aes(
+      y = corrected_observed_prob,
+      linetype = "Optimism-corrected"
+    ),
+    linewidth = 1.1
+  ) +
+
+  facet_wrap(
+    ~ model,
+    nrow = 1
+  ) +
+
+  geom_text(
+  data = stais_calibration_labels,
+  aes(
+    x = -Inf,
+    y = Inf,
+    label = label
+  ),
+  inherit.aes = FALSE,
+  hjust = -0.05,
+  vjust = 1.2,
+  size = 3.5
+) +
+
+  coord_equal() +
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "Apparent" = "dashed",
+      "Optimism-corrected" = "solid"
+    )
+  ) +
+
+  labs(
+    x = "Predicted probability",
+    y = "Observed probability",
+    caption =
+      "Curves are displayed where ≥80% of bootstrap resamples contributed to the optimism estimate. Dotted line indicates perfect calibration."
+  ) +
+
+  theme_classic() +
+
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+stais_calibration_plot
+```
+
+
+
+## 11.15 Save final summary objects
+```{r}
+## Save final STAI-S summary objects
+
+saveRDS(
+  stais_final_results,
+  here("output", "derived", "stais_final_results.rds")
+)
+
+saveRDS(
+  stais_bootstrap_stability,
+  here("output", "derived", "stais_bootstrap_stability.rds")
+)
+
+saveRDS(
+  stais_pd_bootstrap_stability,
+  here("output", "derived", "stais_pd_bootstrap_stability.rds")
+)
+
+saveRDS(
+  stais_incremental_variability,
+  here("output", "derived", "stais_incremental_variability.rds")
+)
+
+saveRDS(
+  stais_optimism_variability,
+  here("output", "derived", "stais_optimism_variability.rds")
+)
+
+saveRDS(
+  stais_calibration_optimism,
+  file.path(
+    stais_bootstrap_output,
+    "stais_calibration_optimism.rds"
+  )
+)
+
+readr::write_csv(
+  stais_final_results$model_performance,
+  here("output", "tables", "stais_model_performance.csv")
+)
+
+readr::write_csv(
+  stais_final_results$incremental_value,
+  here("output", "tables", "stais_incremental_value.csv")
+)
+
+readr::write_csv(
+  stais_bootstrap_stability,
+  here("output", "tables", "stais_bootstrap_stability.csv")
+)
+
+readr::write_csv(
+  stais_pd_bootstrap_stability,
+  here("output", "tables", "stais_pd_bootstrap_stability.csv")
+)
+
+readr::write_csv(
+  stais_incremental_variability,
+  here("output", "tables", "stais_incremental_variability.csv")
+)
+
+readr::write_csv(
+  stais_calibration_support_ranges,
+  file.path(
+    stais_bootstrap_output,
+    "stais_calibration_support_ranges.csv"
+  )
+)
+```
+
+
+
+
+# 12. STAI-T Analysis
+
+## 12.1 Apparent STAI-T models
+```{r}
+
+stait_apparent_baseline <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_stai_t",
+  predictor_vars = baseline_vars,
+  m = 10,
+  seed = 26092026
+)
+
+stait_apparent_full <- fit_apparent_model(
+  data = df,
+  outcome_var = "outcome_stai_t",
+  predictor_vars = full_vars,
+  m = 10,
+  seed = 26092026
+)
+
+
+
+stait_apparent_baseline$performance
+stait_apparent_full$performance
+
+stait_apparent_baseline$mice_logged_events
+stait_apparent_full$mice_logged_events
+
+
+stait_apparent_delta_auc <-
+  stait_apparent_full$performance$auc -
+  stait_apparent_baseline$performance$auc
+
+stait_apparent_idi <- calculate_idi(
+  outcome = df$outcome_stai_t,
+  predicted_baseline =
+    stait_apparent_baseline$predictions$predicted_prob,
+  predicted_full =
+    stait_apparent_full$predictions$predicted_prob
+)
+
+stait_apparent_delta_auc
+stait_apparent_idi
+
+
+
+saveRDS(
+  stait_apparent_baseline,
+  here("output", "derived", "stait_apparent_baseline.rds")
+)
+
+saveRDS(
+  stait_apparent_full,
+  here("output", "derived", "stait_apparent_full.rds")
+)
+
+saveRDS(
+  stait_apparent_idi,
+  here("output", "derived", "stait_apparent_idi.rds")
+)
+```
+
+
+
+
+
+## 12.4 Final STAI-T run
+```{r}
+## 12.4 Final STAI-T analysis with canonical checkpoints
+
+dir.create(
+  stait_bootstrap_output,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+run_paired_bootstrap_checkpointed(
+  data = df,
+  outcome_var = "outcome_stai_t",
+  baseline_vars = baseline_vars,
+  full_vars = full_vars,
+  output_dir = stait_bootstrap_output,
+  outcome_label = "STAIT",
+  B = 1000,
+  m = 10,
+  seed = 26092026
+)
+
+```
+
+### Checks
+```{r}
+## STAI-T post-bootstrap verification
+
+stait_files <- list.files(
+  stait_bootstrap_output,
+  pattern = "^stait_bootstrap_[0-9]{4}\\.rds$",
+  full.names = TRUE
+)
+
+stait_ids <- as.integer(
+  sub(
+    ".*_([0-9]{4})\\.rds$",
+    "\\1",
+    basename(stait_files)
+  )
+)
+
+cat("Number of completed files:", length(stait_files), "\n")
+cat("Missing bootstrap IDs:", setdiff(1:1000, stait_ids), "\n")
+cat("Duplicated IDs:", anyDuplicated(stait_ids), "\n")
+
+tmp_files <- list.files(
+  stait_bootstrap_output,
+  pattern = "\\.tmp$",
+  full.names = TRUE
+)
+
+cat("Temporary files remaining:", length(tmp_files), "\n")
+
+```
+
+### Combine the 1,000 canonical STAI-T checkpoints
+```{r}
+## Combine canonical STAI-T bootstrap checkpoints
+
+stait_files <- stait_files[order(stait_ids)]
+stait_ids <- sort(stait_ids)
+
+stait_checkpoint_objects <- lapply(
+  stait_files,
+  readRDS
+)
+
+stait_comparison <- dplyr::bind_rows(
+  lapply(stait_checkpoint_objects, `[[`, "comparison")
+)
+
+stait_performance <- dplyr::bind_rows(
+  lapply(stait_checkpoint_objects, `[[`, "performance")
+)
+
+stait_tuning <- dplyr::bind_rows(
+  lapply(stait_checkpoint_objects, `[[`, "tuning")
+)
+
+stait_coefficients <- dplyr::bind_rows(
+  lapply(stait_checkpoint_objects, `[[`, "coefficients")
+)
+
+stait_diagnostics <- dplyr::bind_rows(
+  lapply(stait_checkpoint_objects, `[[`, "diagnostics")
+)
+
+stait_predictions <- purrr::map2_dfr(
+  stait_checkpoint_objects,
+  stait_ids,
+  function(x, b) {
+
+    dplyr::bind_rows(
+
+      x$predictions$baseline$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$baseline$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "baseline",
+          sample = "validation",
+          .before = 1
+        ),
+
+      x$predictions$full$bootstrap %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "bootstrap",
+          .before = 1
+        ),
+
+      x$predictions$full$validation %>%
+        dplyr::mutate(
+          bootstrap = b,
+          model = "full",
+          sample = "validation",
+          .before = 1
+        )
+    )
+  }
+)
+
+stait_bootstrap_indices <- tibble::tibble(
+  bootstrap = stait_ids,
+  bootstrap_index = lapply(
+    stait_checkpoint_objects,
+    `[[`,
+    "bootstrap_index"
+  )
+)
+
+stait_final_bootstrap <- list(
+  comparison = stait_comparison,
+  performance = stait_performance,
+  tuning = stait_tuning,
+  coefficients = stait_coefficients,
+  diagnostics = stait_diagnostics,
+  predictions = stait_predictions,
+  bootstrap_indices = stait_bootstrap_indices
+)
+```
+
+### Save
+```{r}
+saveRDS(
+  stait_final_bootstrap,
+  file.path(
+    stait_bootstrap_output,
+    "stait_bootstrap_combined_1000x10.rds"
+  )
+)
+```
+
+
+### Structural checks
+
+```{r}
+cat("Comparison rows:", nrow(stait_final_bootstrap$comparison), "\n")
+cat("Performance rows:", nrow(stait_final_bootstrap$performance), "\n")
+cat("Tuning rows:", nrow(stait_final_bootstrap$tuning), "\n")
+cat("Diagnostics rows:", nrow(stait_final_bootstrap$diagnostics), "\n")
+cat("Prediction rows:", nrow(stait_final_bootstrap$predictions), "\n")
+cat("Bootstrap-index rows:", nrow(stait_final_bootstrap$bootstrap_indices), "\n")
+
+cat(
+  "Missing prediction probabilities:",
+  sum(is.na(stait_final_bootstrap$predictions$predicted_prob)),
+  "\n"
+)
+
+stait_final_bootstrap$predictions %>%
+  count(model, sample)
+```
+
+## 12.4 Bootstrap diagnostics
+```{r}
+
+
+# MICE integrity
+stait_final_bootstrap$diagnostics %>%
+  summarise(
+    n_rows = n(),
+    dev_mice_events = sum(dev_mice_logged_events),
+    val_mice_events = sum(val_mice_logged_events)
+  )
+
+# glmnet / sparse-event diagnostics
+stait_final_bootstrap$tuning %>%
+  summarise(
+    n_fits = n(),
+    fits_with_warning = sum(glmnet_warning_n > 0),
+    percent_with_warning =
+      100 * mean(glmnet_warning_n > 0),
+    lowest_cv_events = min(min_cv_events),
+    lowest_cv_unique_events =
+      min(min_cv_unique_events)
+  )
+
+# Incremental-value completeness
+stait_final_bootstrap$comparison %>%
+  summarise(
+    missing_delta_auc =
+      sum(is.na(delta_auc_validation)),
+    missing_idi =
+      sum(is.na(idi_validation)),
+    missing_optimism_delta_auc =
+      sum(is.na(optimism_delta_auc)),
+    missing_optimism_idi =
+      sum(is.na(optimism_idi))
+  )
+
+# Calibration edge cases
+stait_final_bootstrap$performance %>%
+  summarise(
+    n_models = n(),
+    nonestimable_bootstrap_slopes =
+      sum(is.na(calibration_slope_bootstrap)),
+    nonestimable_validation_slopes =
+      sum(is.na(calibration_slope_validation)),
+    missing_bootstrap_auc =
+      sum(is.na(auc_bootstrap)),
+    missing_validation_auc =
+      sum(is.na(auc_validation)),
+    missing_bootstrap_intercepts =
+      sum(is.na(calibration_intercept_bootstrap)),
+    missing_validation_intercepts =
+      sum(is.na(calibration_intercept_validation))
+  )
+```
+
+## 12.6 12.5 Final optimism-corrected STAI-T results
+```{r}
+
+
+
+stait_final_results <- calculate_optimism_corrected(
+  apparent_baseline = stait_apparent_baseline,
+  apparent_full = stait_apparent_full,
+  apparent_idi = stait_apparent_idi,
+  paired_bootstrap = stait_final_bootstrap
+)
+
+stait_final_results$model_performance
+stait_final_results$incremental_value
+
+```
+
+
+## 12.6 STAI-T incremental-value variability
+```{r}
+
+
+
+stait_incremental_variability <-
+  stait_final_bootstrap$comparison %>%
+  summarise(
+    delta_auc_validation_mean =
+      mean(delta_auc_validation),
+
+    delta_auc_validation_median =
+      median(delta_auc_validation),
+
+    delta_auc_validation_p025 =
+      quantile(delta_auc_validation, 0.025),
+
+    delta_auc_validation_p975 =
+      quantile(delta_auc_validation, 0.975),
+
+    proportion_delta_auc_positive =
+      mean(delta_auc_validation > 0),
+
+    idi_validation_mean =
+      mean(idi_validation),
+
+    idi_validation_median =
+      median(idi_validation),
+
+    idi_validation_p025 =
+      quantile(idi_validation, 0.025),
+
+    idi_validation_p975 =
+      quantile(idi_validation, 0.975),
+
+    proportion_idi_positive =
+      mean(idi_validation > 0)
+  )
+
+stait_incremental_variability
+
+
+stait_optimism_variability <-
+  stait_final_bootstrap$comparison %>%
+  summarise(
+    optimism_delta_auc_mean =
+      mean(optimism_delta_auc),
+
+    optimism_delta_auc_p025 =
+      quantile(optimism_delta_auc, 0.025),
+
+    optimism_delta_auc_p975 =
+      quantile(optimism_delta_auc, 0.975),
+
+    optimism_idi_mean =
+      mean(optimism_idi),
+
+    optimism_idi_p025 =
+      quantile(optimism_idi, 0.025),
+
+    optimism_idi_p975 =
+      quantile(optimism_idi, 0.975)
+  )
+
+stait_optimism_variability
+
+```
+
+
+
+
+## 12.7 STAI-T predictor-selection stability
+```{r}
+
+
+stait_selection_by_bootstrap <-
+  stait_final_bootstrap$coefficients %>%
+  group_by(
+    model,
+    bootstrap,
+    variable
+  ) %>%
+  summarise(
+    n_selected = sum(selected),
+
+    proportion_imputations_selected =
+      mean(selected),
+
+    n_positive =
+      sum(selected & coefficient > 0),
+
+    n_negative =
+      sum(selected & coefficient < 0),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    majority_selected =
+      n_selected >= 5,
+
+    predominant_direction =
+      case_when(
+        n_positive > n_negative ~ "positive",
+        n_negative > n_positive ~ "negative",
+        TRUE ~ "mixed"
+      )
+  )
+
+
+stait_bootstrap_stability <-
+  stait_selection_by_bootstrap %>%
+  group_by(
+    model,
+    variable
+  ) %>%
+  summarise(
+    mean_imputation_selection =
+      mean(proportion_imputations_selected),
+
+    bootstrap_majority_frequency =
+      mean(majority_selected),
+
+    n_bootstraps_majority_selected =
+      sum(majority_selected),
+
+    positive_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "positive"
+      ),
+
+    negative_when_majority_selected =
+      sum(
+        majority_selected &
+          predominant_direction == "negative"
+      ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    predominant_bootstrap_direction =
+      case_when(
+        positive_when_majority_selected >
+          negative_when_majority_selected ~ "positive",
+
+        negative_when_majority_selected >
+          positive_when_majority_selected ~ "negative",
+
+        TRUE ~ "mixed"
+      ),
+
+    bootstrap_direction_consistency =
+      if_else(
+        n_bootstraps_majority_selected > 0,
+
+        pmax(
+          positive_when_majority_selected,
+          negative_when_majority_selected
+        ) /
+          n_bootstraps_majority_selected,
+
+        NA_real_
+      )
+  ) %>%
+  arrange(
+    model,
+    desc(bootstrap_majority_frequency)
+  )
+
+
+stait_pd_bootstrap_stability <-
+  stait_bootstrap_stability %>%
+  filter(
+    model == "full",
+    variable %in% pd_vars
+  ) %>%
+  arrange(
+    desc(bootstrap_majority_frequency)
+  )
+
+stait_pd_bootstrap_stability
+```
+
+## 12.8 STAI-T calibration
+```{r}
+
+
+stait_calibration_grids <- list(
+
+  baseline = seq(
+    quantile(
+      stait_apparent_baseline$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      stait_apparent_baseline$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  ),
+
+  full = seq(
+    quantile(
+      stait_apparent_full$predictions$predicted_prob,
+      0.025
+    ),
+    quantile(
+      stait_apparent_full$predictions$predicted_prob,
+      0.975
+    ),
+    length.out = 101
+  )
+)
+
+
+stait_apparent_calibration_curves <-
+  bind_rows(
+
+    estimate_calibration_curve(
+      outcome =
+        stait_apparent_baseline$predictions$outcome,
+      predicted_prob =
+        stait_apparent_baseline$predictions$predicted_prob,
+      grid =
+        stait_calibration_grids$baseline
+    ) %>%
+      mutate(
+        model = "baseline",
+        .before = 1
+      ),
+
+    estimate_calibration_curve(
+      outcome =
+        stait_apparent_full$predictions$outcome,
+      predicted_prob =
+        stait_apparent_full$predictions$predicted_prob,
+      grid =
+        stait_calibration_grids$full
+    ) %>%
+      mutate(
+        model = "full",
+        .before = 1
+      )
+  )
+
+stait_apparent_calibration_curves
+
+
+## Bootstrap calibration curves
+stait_calibration_bootstrap <-
+  purrr::map_dfr(
+    c("baseline", "full"),
+    function(model_name) {
+
+      grid <-
+        stait_calibration_grids[[model_name]]
+
+      purrr::map_dfr(
+        1:1000,
+        function(b) {
+
+          bootstrap_predictions <-
+            stait_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "bootstrap"
+            )
+
+          validation_predictions <-
+            stait_final_bootstrap$predictions %>%
+            filter(
+              bootstrap == b,
+              model == model_name,
+              sample == "validation"
+            )
+
+          bootstrap_curve <-
+            estimate_calibration_curve(
+              outcome =
+                bootstrap_predictions$outcome,
+              predicted_prob =
+                bootstrap_predictions$predicted_prob,
+              grid = grid
+            )
+
+          validation_curve <-
+            estimate_calibration_curve(
+              outcome =
+                validation_predictions$outcome,
+              predicted_prob =
+                validation_predictions$predicted_prob,
+              grid = grid
+            )
+
+          tibble(
+            bootstrap = b,
+            model = model_name,
+            predicted_prob = grid,
+
+            calibration_bootstrap =
+              bootstrap_curve$observed_prob,
+
+            calibration_validation =
+              validation_curve$observed_prob,
+
+            optimism =
+              calibration_bootstrap -
+              calibration_validation
+          )
+        }
+      )
+    }
+  )
+
+## Pointwise optimism 
+stait_calibration_optimism <-
+  stait_calibration_bootstrap %>%
+  group_by(
+    model,
+    predicted_prob
+  ) %>%
+  summarise(
+    mean_optimism =
+      mean(optimism, na.rm = TRUE),
+
+    n_contributing =
+      sum(!is.na(optimism)),
+
+    .groups = "drop"
+  )
+
+
+## Corrected curves
+stait_calibration_corrected <-
+  stait_apparent_calibration_curves %>%
+  left_join(
+    stait_calibration_optimism,
+    by = c(
+      "model",
+      "predicted_prob"
+    )
+  ) %>%
+  mutate(
+    corrected_observed_prob_raw =
+      observed_prob - mean_optimism,
+
+    corrected_observed_prob =
+      pmin(
+        pmax(
+          corrected_observed_prob_raw,
+          0
+        ),
+        1
+      ),
+
+    proportion_bootstraps_contributing =
+      n_contributing / 1000
+  )
+```
+
+### Support summary
+```{r}
+stait_calibration_support_ranges <-
+  stait_calibration_corrected %>%
+  group_by(model) %>%
+  summarise(
+    apparent_min =
+      min(predicted_prob),
+
+    apparent_max =
+      max(predicted_prob),
+
+    min_90 =
+      min(
+        predicted_prob[
+          proportion_bootstraps_contributing >= 0.90
+        ]
+      ),
+
+    max_90 =
+      max(
+        predicted_prob[
+          proportion_bootstraps_contributing >= 0.90
+        ]
+      ),
+
+    min_80 =
+      min(
+        predicted_prob[
+          proportion_bootstraps_contributing >= 0.80
+        ]
+      ),
+
+    max_80 =
+      max(
+        predicted_prob[
+          proportion_bootstraps_contributing >= 0.80
+        ]
+      ),
+
+    .groups = "drop"
+  )
+
+stait_calibration_support_ranges
+```
+
+### Calibration plot setup
+```{r}
+stait_calibration_plot_data <-
+  stait_calibration_corrected %>%
+  filter(
+    proportion_bootstraps_contributing >= 0.80
+  ) %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    )
+  )
+```
+
+
+### Create cal plot labels 
+```{r}
+stait_calibration_labels <-
+  stait_final_results$model_performance %>%
+  transmute(
+    model = factor(
+      model,
+      levels = c("baseline", "full"),
+      labels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    ),
+
+    label = sprintf(
+      "Calibration intercept = %.2f\nCalibration slope = %.2f",
+      calibration_intercept_optimism_corrected,
+      calibration_slope_optimism_corrected
+    )
+  )
+```
+
+
+## Create calibration plot
+```{r}
+stait_calibration_plot <-
+  ggplot(
+    stait_calibration_plot_data,
+    aes(x = predicted_prob)
+  ) +
+
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dotted",
+    linewidth = 0.7
+  ) +
+
+  geom_line(
+    aes(
+      y = observed_prob,
+      linetype = "Apparent"
+    ),
+    linewidth = 0.9
+  ) +
+
+  geom_line(
+    aes(
+      y = corrected_observed_prob,
+      linetype = "Optimism-corrected"
+    ),
+    linewidth = 1.1
+  ) +
+
+  facet_wrap(
+    ~ model,
+    nrow = 1
+  ) +
+
+  geom_text(
+    data = stait_calibration_labels,
+    aes(
+      x = -Inf,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.5
+  ) +
+
+  coord_equal() +
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "Apparent" = "dashed",
+      "Optimism-corrected" = "solid"
+    )
+  ) +
+
+  labs(
+    x = "Predicted probability",
+    y = "Observed probability",
+    caption =
+      "Curves are displayed where ≥80% of bootstrap resamples contributed to the optimism estimate. Dotted line indicates perfect calibration."
+  ) +
+
+  theme_classic() +
+
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+stait_calibration_plot
+```
+## 12.9 Save final STAI-T summary objects
+
+```{r}
+## 12.9 Save final STAI-T summary objects
+
+saveRDS(
+  stait_final_results,
+  here(
+    "output",
+    "derived",
+    "stait_final_results.rds"
+  )
+)
+
+saveRDS(
+  stait_incremental_variability,
+  here(
+    "output",
+    "derived",
+    "stait_incremental_variability.rds"
+  )
+)
+
+saveRDS(
+  stait_optimism_variability,
+  here(
+    "output",
+    "derived",
+    "stait_optimism_variability.rds"
+  )
+)
+
+saveRDS(
+  stait_bootstrap_stability,
+  here(
+    "output",
+    "derived",
+    "stait_bootstrap_stability.rds"
+  )
+)
+
+saveRDS(
+  stait_pd_bootstrap_stability,
+  here(
+    "output",
+    "derived",
+    "stait_pd_bootstrap_stability.rds"
+  )
+)
+
+saveRDS(
+  stait_calibration_bootstrap,
+  file.path(
+    stait_bootstrap_output,
+    "stait_calibration_bootstrap_curves.rds"
+  )
+)
+
+saveRDS(
+  stait_calibration_optimism,
+  file.path(
+    stait_bootstrap_output,
+    "stait_calibration_optimism.rds"
+  )
+)
+
+saveRDS(
+  stait_calibration_corrected,
+  file.path(
+    stait_bootstrap_output,
+    "stait_calibration_corrected_curve.rds"
+  )
+)
+
+
+## Manuscript-ready tables
+
+readr::write_csv(
+  stait_final_results$model_performance,
+  here(
+    "output",
+    "tables",
+    "stait_model_performance.csv"
+  )
+)
+
+readr::write_csv(
+  stait_final_results$incremental_value,
+  here(
+    "output",
+    "tables",
+    "stait_incremental_value.csv"
+  )
+)
+
+readr::write_csv(
+  stait_bootstrap_stability,
+  here(
+    "output",
+    "tables",
+    "stait_bootstrap_stability.csv"
+  )
+)
+
+readr::write_csv(
+  stait_pd_bootstrap_stability,
+  here(
+    "output",
+    "tables",
+    "stait_pd_bootstrap_stability.csv"
+  )
+)
+
+readr::write_csv(
+  stait_incremental_variability,
+  here(
+    "output",
+    "tables",
+    "stait_incremental_variability.csv"
+  )
+)
+
+readr::write_csv(
+  stait_calibration_support_ranges,
+  file.path(
+    stait_bootstrap_output,
+    "stait_calibration_support_ranges.csv"
+  )
+)
+
+readr::write_csv(
+  stait_calibration_plot_data,
+  file.path(
+    stait_bootstrap_output,
+    "stait_calibration_plot_data.csv"
+  )
+)
+
+
+## Calibration figure
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "stait_calibration.png"
+  ),
+  plot = stait_calibration_plot,
+  width = 8,
+  height = 4.5,
+  dpi = 300
+)
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "stait_calibration.pdf"
+  ),
+  plot = stait_calibration_plot,
+  width = 8,
+  height = 4.5
+)
+```
+
+
+# 13 Master model-performance table
+
+## 13.1 Cross-outcome summary
+```{r}
+master_model_performance <-
+  bind_rows(
+    epds_final_results$model_performance %>%
+      mutate(outcome = "EPDS"),
+
+    stais_final_results$model_performance %>%
+      mutate(outcome = "STAI-S"),
+
+    stait_final_results$model_performance %>%
+      mutate(outcome = "STAI-T")
+  ) %>%
+  select(
+    outcome,
+    model,
+
+    apparent_auc = auc,
+    mean_optimism_auc,
+    optimism_corrected_auc =
+      auc_optimism_corrected,
+
+    apparent_calibration_intercept =
+      calibration_intercept,
+    mean_optimism_calibration_intercept,
+    optimism_corrected_calibration_intercept =
+      calibration_intercept_optimism_corrected,
+
+    apparent_calibration_slope =
+      calibration_slope,
+    mean_optimism_calibration_slope,
+    optimism_corrected_calibration_slope =
+      calibration_slope_optimism_corrected
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c("EPDS", "STAI-S", "STAI-T")
+    ),
+    model = factor(
+      model,
+      levels = c("baseline", "full")
+    )
+  ) %>%
+  arrange(outcome, model)
+
+master_model_performance
+
+
+readr::write_csv(
+  master_model_performance,
+  here(
+    "output",
+    "tables",
+    "master_model_performance.csv"
+  )
+)
+
+```
+
+## 13.2 Master predictor stability table
+```{r}
+# 13.3 Cross-outcome PD predictor-selection stability
+
+master_pd_stability_long <-
+  bind_rows(
+
+    epds_pd_bootstrap_stability %>%
+      mutate(outcome = "EPDS"),
+
+    stais_pd_bootstrap_stability %>%
+      mutate(outcome = "STAI-S"),
+
+    stait_pd_bootstrap_stability %>%
+      mutate(outcome = "STAI-T")
+  ) %>%
+  mutate(
+
+    outcome = factor(
+      outcome,
+      levels = c("EPDS", "STAI-S", "STAI-T")
+    ),
+
+    # Variables ending in 2 are late-pregnancy measures
+    timepoint = if_else(
+      grepl("2$", variable),
+      "Late pregnancy",
+      "Early pregnancy"
+    ),
+
+    # Paired underlying PD measure code
+    measure_code = sub("2$", "", variable),
+
+    selection_frequency_percent =
+      100 * bootstrap_majority_frequency,
+
+    direction_consistency_percent =
+      100 * bootstrap_direction_consistency
+  ) %>%
+  select(
+    outcome,
+    variable,
+    measure_code,
+    timepoint,
+    mean_imputation_selection,
+    selection_frequency_percent,
+    n_bootstraps_majority_selected,
+    predominant_bootstrap_direction,
+    direction_consistency_percent
+  ) %>%
+  arrange(
+    measure_code,
+    timepoint,
+    outcome
+  )
+
+master_pd_stability_long
+```
+
+### Create cross-outcome table 
+```{r}
+master_pd_stability_table <-
+  master_pd_stability_long %>%
+  mutate(
+    pd_measure = recode(
+      measure_code,
+      "PARDiff" = "Dilation at Response",
+      "RodDiff" = "Net Pupil Change",
+      "PCUDiff" = "Early Peak Pupil Change",
+      "PAADiff" = "Late Sustained Dilation",
+      "PTRDiff" = "Early Mean Pupil Size"
+    )
+  ) %>%
+  select(
+    pd_measure,
+    timepoint,
+    outcome,
+    selection_frequency_percent,
+    predominant_bootstrap_direction,
+    direction_consistency_percent
+  ) %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = c(
+      selection_frequency_percent,
+      predominant_bootstrap_direction,
+      direction_consistency_percent
+    ),
+    names_glue = "{outcome}_{.value}"
+  ) %>%
+  arrange(
+    factor(
+      pd_measure,
+      levels = c(
+        "Early Mean Pupil Size",
+        "Early Peak Pupil Change",
+        "Late Sustained Dilation",
+        "Dilation at Response",
+        "Net Pupil Change"
+      )
+    ),
+    factor(
+      timepoint,
+      levels = c(
+        "Early pregnancy",
+        "Late pregnancy"
+      )
+    )
+  )
+
+master_pd_stability_table
+```
+
+### Save both versions
+```{r}
+readr::write_csv(
+  master_pd_stability_long,
+  here(
+    "output",
+    "tables",
+    "master_pd_stability_long.csv"
+  )
+)
+
+readr::write_csv(
+  master_pd_stability_table,
+  here(
+    "output",
+    "tables",
+    "master_pd_stability_table.csv"
+  )
+)
+```
+
+## 13.3 Combine the three calibration plots into one manuscript figure
+```{r}
+# 13.4 Combined calibration figure
+
+master_calibration_plot_data <-
+  bind_rows(
+
+    epds_calibration_plot_data %>%
+      mutate(outcome = "EPDS"),
+
+    stais_calibration_plot_data %>%
+      mutate(outcome = "STAI-S"),
+
+    stait_calibration_plot_data %>%
+      mutate(outcome = "STAI-T")
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c("EPDS", "STAI-S", "STAI-T")
+    ),
+
+    model = factor(
+      model,
+      levels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    )
+  )
+```
+
+## Combine labels
+```{r}
+master_calibration_labels <-
+  bind_rows(
+
+    epds_calibration_labels %>%
+      mutate(outcome = "EPDS"),
+
+    stais_calibration_labels %>%
+      mutate(outcome = "STAI-S"),
+
+    stait_calibration_labels %>%
+      mutate(outcome = "STAI-T")
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c("EPDS", "STAI-S", "STAI-T")
+    ),
+
+    model = factor(
+      model,
+      levels = c(
+        "Baseline model",
+        "Full model (+ PD)"
+      )
+    )
+  )
+```
+
+### Make figure 
+```{r}
+master_calibration_plot <-
+  ggplot(
+    master_calibration_plot_data,
+    aes(x = predicted_prob)
+  ) +
+
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dotted",
+    linewidth = 0.7
+  ) +
+
+  geom_line(
+  aes(
+    y = observed_prob,
+    linetype = "Apparent",
+    color = "Apparent"
+  ),
+  linewidth = 0.9
+) +
+
+geom_line(
+  aes(
+    y = corrected_observed_prob,
+    linetype = "Optimism-corrected",
+    color = "Optimism-corrected"
+  ),
+  linewidth = 1.1
+) +
+
+  facet_grid(
+    outcome ~ model
+  ) +
+
+  geom_text(
+    data = master_calibration_labels,
+    aes(
+      x = -Inf,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.2
+  ) +
+
+  coord_equal() +
+
+  scale_linetype_manual(
+  name = NULL,
+  values = c(
+    "Apparent" = "dashed",
+    "Optimism-corrected" = "solid"
+  )
+) +
+
+scale_color_manual(
+  name = NULL,
+  values = c(
+    "Apparent" = "#D55E00",
+    "Optimism-corrected" = "#0072B2"
+  )
+)  +
+
+  labs(
+    x = "Predicted probability",
+    y = "Observed probability",
+    caption =
+      "Curves are displayed where ≥80% of bootstrap resamples contributed to the optimism estimate. Dotted line indicates perfect calibration."
+  ) +
+
+  theme_classic() +
+
+  theme(
+    legend.position = "bottom",
+
+    strip.text.x =
+      element_text(face = "bold"),
+
+    strip.text.y =
+      element_text(face = "bold"),
+
+    strip.background =
+      element_rect(
+        fill = "white",
+        colour = "black"
+      )
+  )
+
+master_calibration_plot
+```
+
+### Save
+```{r}
+# Save combined calibration figure
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "master_calibration_plot.png"
+  ),
+  plot = master_calibration_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+ggsave(
+  filename = here(
+    "output",
+    "figures",
+    "master_calibration_plot.pdf"
+  ),
+  plot = master_calibration_plot,
+  width = 8,
+  height = 10
+)
+
+readr::write_csv(
+  master_calibration_plot_data,
+  here(
+    "output",
+    "tables",
+    "master_calibration_plot_data.csv"
+  )
+)
+
+readr::write_csv(
+  master_calibration_labels,
+  here(
+    "output",
+    "tables",
+    "master_calibration_labels.csv"
+  )
+)
+
+```
+
+
+
+## 13.4 Master incremental-value table
+```{r}
+
+combine_incremental_results <- function(
+  outcome_label,
+  final_results,
+  variability
+) {
+
+  bind_cols(
+    tibble(outcome = outcome_label),
+    final_results$incremental_value,
+    variability
+  )
+}
+
+
+master_incremental_value <-
+  bind_rows(
+    combine_incremental_results(
+      "EPDS",
+      epds_final_results,
+      epds_incremental_variability
+    ),
+
+    combine_incremental_results(
+      "STAI-S",
+      stais_final_results,
+      stais_incremental_variability
+    ),
+
+    combine_incremental_results(
+      "STAI-T",
+      stait_final_results,
+      stait_incremental_variability
+    )
+  )
+
+master_incremental_value
+
+
+
+master_incremental_value %>%
+  select(
+    outcome,
+
+    apparent_delta_auc,
+    mean_optimism_delta_auc,
+    optimism_corrected_delta_auc,
+
+    delta_auc_validation_median,
+    delta_auc_validation_p025,
+    delta_auc_validation_p975,
+    proportion_delta_auc_positive,
+
+    apparent_idi,
+    mean_optimism_idi,
+    optimism_corrected_idi,
+
+    idi_validation_median,
+    idi_validation_p025,
+    idi_validation_p975,
+    proportion_idi_positive
+  )
+
+
+readr::write_csv(
+  master_incremental_value,
+  here(
+    "output",
+    "tables",
+    "master_incremental_value.csv"
+  )
+)
+
+```
+
+
+# 14 Sample-size/model-complexity assessment 
+
+## 14.1 Install/load pmsampsize
+```{r}
+if (!requireNamespace("pmsampsize", quietly = TRUE)) {
+  renv::install("pmsampsize")
+}
+
+library(pmsampsize)
+```
+
+### 14.2 Define the scenarios
+```{r}
+# 14. Formal sample-size adequacy assessment
+
+sample_size_inputs <- tibble::tribble(
+  ~outcome, ~events, ~prevalence,
+  "EPDS",   13L,     13/91,
+  "STAI-S", 12L,     12/91,
+  "STAI-T", 21L,     21/91
+)
+
+candidate_cstats <- c(
+  0.70,
+  0.75,
+  0.80
+)
+
+sample_size_scenarios <-
+  tidyr::crossing(
+    sample_size_inputs,
+    model = c("baseline", "full"),
+    cstatistic = candidate_cstats
+  ) %>%
+  mutate(
+    parameters = if_else(
+      model == "baseline",
+      32L,
+      42L
+    )
+  )
+
+sample_size_scenarios
+```
+
+
+### 14.3 Run the calculations
+```{r}
+pmsampsize_results <-
+  purrr::pmap(
+    sample_size_scenarios,
+    function(
+      outcome,
+      events,
+      prevalence,
+      model,
+      cstatistic,
+      parameters
+    ) {
+
+      pmsampsize::pmsampsize(
+        type = "b",
+        cstatistic = cstatistic,
+        parameters = parameters,
+        prevalence = prevalence,
+        shrinkage = 0.90
+      )
+    }
+  )
+```
+
+### 14.4 Make one readable summary
+```{r}
+pmsampsize_summary <-
+  purrr::map2_dfr(
+    seq_len(nrow(sample_size_scenarios)),
+    pmsampsize_results,
+    function(i, result) {
+
+      scenario <-
+        sample_size_scenarios[i, ]
+
+      tibble(
+        outcome =
+          scenario$outcome,
+
+        model =
+          scenario$model,
+
+        parameters =
+          scenario$parameters,
+
+        prevalence =
+          scenario$prevalence,
+
+        observed_events =
+          scenario$events,
+
+        assumed_cstatistic =
+          scenario$cstatistic,
+
+        estimated_cox_snell_r2 =
+          result$rsquared,
+
+        minimum_sample_size =
+          result$sample_size,
+
+        required_events =
+          ceiling(result$events),
+
+        required_EPP =
+          result$EPP,
+
+        final_shrinkage =
+          result$final_shrinkage,
+
+        observed_sample_size =
+          91L,
+
+        sample_size_shortfall =
+          result$sample_size - 91L,
+
+        observed_EPP =
+          scenario$events /
+          scenario$parameters
+      )
+    }
+  )
+
+pmsampsize_summary
+
+```
+### Save
+```{r}
+readr::write_csv(
+  pmsampsize_summary,
+  here(
+    "output",
+    "tables",
+    "pmsampsize_sensitivity_analysis.csv"
+  )
+)
+```
+
+### Create compact table
+```{r}
+pmsampsize_primary_summary <-
+  pmsampsize_summary %>%
+  filter(assumed_cstatistic == 0.75) %>%
+  select(
+    outcome,
+    model,
+    parameters,
+    prevalence,
+    observed_events,
+    observed_EPP,
+    minimum_sample_size,
+    required_events,
+    required_EPP
+  )
+
+pmsampsize_primary_summary
+
+
+
+
+readr::write_csv(
+  pmsampsize_primary_summary,
+  here(
+    "output",
+    "tables",
+    "pmsampsize_primary_summary.csv"
+  )
+)
+```
+
+
+
+# Supplementary correlations
+
+Observed pairs are the primary exploratory analysis; separate full-cohort
+multiple imputation supplies the sensitivity analysis.
+
+```{r}
+#| label: supplementary-correlation-analysis
+source(here("code", "run_correlations.R"))
+```
+
+
+# Refresh pupil figure labels from saved estimates
+
+This optional reporting-only chunk regenerates the S2 schematic and correlation figures with the Net Pupil Change label. It reads saved correlation estimates and does not refit models or regenerate imputations.
+
+```{r}
+#| label: rebuild-pupil-presentation
+#| eval: false
+source(here::here("code", "rebuild_pd_presentation.R"))
+rebuild_pd_presentation(here::here())
+```
